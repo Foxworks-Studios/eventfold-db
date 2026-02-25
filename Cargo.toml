@@ -1,0 +1,8 @@
+[package]
+name = "eventfold-db"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight, single-node event store for event sourcing and CQRS"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
