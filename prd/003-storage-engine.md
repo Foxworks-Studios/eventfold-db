@@ -1,5 +1,7 @@
 # PRD 003: Storage Engine
 
+**Status:** TICKETS READY
+
 ## Summary
 
 Implement the core storage engine: the in-memory index, log file management, startup recovery, append operations with optimistic concurrency, and read operations (ReadStream, ReadAll). This is the heart of EventfoldDB -- the stateful component that owns event data.
