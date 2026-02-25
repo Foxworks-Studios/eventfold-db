@@ -69,6 +69,7 @@ docs/
 
 ### Code style
 
+- Use the `/rust-best-practices` skill when writing, reviewing, or refactoring Rust code.
 - snake_case for functions/variables/modules, PascalCase for types/traits, SCREAMING_SNAKE_CASE for constants.
 - All public items must have doc comments.
 - No `.unwrap()` in library code. Use `.expect()` only for invariant violations with a descriptive message.
