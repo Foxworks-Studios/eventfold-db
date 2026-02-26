@@ -4,6 +4,8 @@
 //! proposed events (client-submitted), recorded events (server-persisted with positions),
 //! expected version semantics for optimistic concurrency, and size limit constants.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use uuid::Uuid;
 
@@ -95,6 +97,25 @@ pub enum ExpectedVersion {
     NoStream,
     /// Stream must be at exactly this version (zero-based).
     Exact(u64),
+}
+
+/// A message yielded by subscription streams (`subscribe_all`, `subscribe_stream`).
+///
+/// During the catch-up phase, the stream yields `Event` variants wrapping each historical
+/// event in an `Arc` to avoid deep-cloning event data across subscribers. Once catch-up
+/// completes, the stream yields a single `CaughtUp` marker, after which it transitions to
+/// forwarding live events from the broadcast channel.
+///
+/// # Variants
+///
+/// * `Event(Arc<RecordedEvent>)` - A recorded event, shared via `Arc` across subscribers.
+/// * `CaughtUp` - Marks the end of the catch-up phase; all historical events have been sent.
+#[derive(Debug, Clone)]
+pub enum SubscriptionMessage {
+    /// A recorded event, shared via `Arc` to avoid deep-cloning across subscribers.
+    Event(Arc<RecordedEvent>),
+    /// Marks the end of the catch-up phase.
+    CaughtUp,
 }
 
 #[cfg(test)]
@@ -242,5 +263,64 @@ mod tests {
     #[test]
     fn max_event_type_len_is_256() {
         assert_eq!(MAX_EVENT_TYPE_LEN, 256);
+    }
+
+    // SubscriptionMessage tests (PRD 005, Ticket 1)
+
+    #[test]
+    fn subscription_message_event_debug_is_non_empty() {
+        let event = RecordedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: Uuid::new_v4(),
+            stream_version: 0,
+            global_position: 0,
+            event_type: "TestEvent".to_string(),
+            metadata: Bytes::new(),
+            payload: Bytes::from_static(b"{}"),
+        };
+        let msg = SubscriptionMessage::Event(std::sync::Arc::new(event));
+        let debug_str = format!("{:?}", msg);
+        assert!(!debug_str.is_empty());
+    }
+
+    #[test]
+    fn subscription_message_caught_up_debug_is_non_empty() {
+        let msg = SubscriptionMessage::CaughtUp;
+        let debug_str = format!("{:?}", msg);
+        assert!(!debug_str.is_empty());
+    }
+
+    #[test]
+    fn subscription_message_clone_event_shares_arc() {
+        let event = RecordedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: Uuid::new_v4(),
+            stream_version: 0,
+            global_position: 0,
+            event_type: "TestEvent".to_string(),
+            metadata: Bytes::new(),
+            payload: Bytes::from_static(b"{}"),
+        };
+        let arc = std::sync::Arc::new(event);
+        let msg = SubscriptionMessage::Event(arc.clone());
+        let cloned = msg.clone();
+
+        // Cloning the message must not deep-clone the RecordedEvent allocation.
+        match (&msg, &cloned) {
+            (SubscriptionMessage::Event(a), SubscriptionMessage::Event(b)) => {
+                assert!(std::sync::Arc::ptr_eq(a, b));
+            }
+            _ => panic!("expected Event variant"),
+        }
+    }
+
+    #[test]
+    fn async_stream_dependency_compiles() {
+        // Confirms that the async-stream crate is available.
+        // The stream! macro requires an async context, so we just verify it resolves.
+        use async_stream::stream;
+        let _s = stream! {
+            yield 1u32;
+        };
     }
 }

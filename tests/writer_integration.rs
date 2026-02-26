@@ -4,7 +4,9 @@
 //! at the crate root and work together end-to-end: spawn the writer against a
 //! tempdir-backed store, append events, and read them back via `ReadIndex`.
 
-use eventfold_db::{ExpectedVersion, ProposedEvent, ReadIndex, Store, WriterHandle, spawn_writer};
+use eventfold_db::{
+    Broker, ExpectedVersion, ProposedEvent, ReadIndex, Store, WriterHandle, spawn_writer,
+};
 
 /// Helper: create a `ProposedEvent` with minimal fields for testing.
 fn proposed(event_type: &str) -> ProposedEvent {
@@ -23,7 +25,7 @@ async fn spawn_writer_append_two_events_read_back() {
     let path = dir.path().join("events.log");
     let store = Store::open(&path).expect("Store::open should succeed");
 
-    let (handle, read_index, join_handle) = spawn_writer(store, 8);
+    let (handle, read_index, join_handle) = spawn_writer(store, 8, Broker::new(64));
 
     // Verify the types are the expected crate-root re-exports.
     // These bindings prove `WriterHandle`, `ReadIndex`, and `spawn_writer`

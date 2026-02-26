@@ -1,5 +1,7 @@
 # PRD 005: Subscription Broker
 
+**Status:** TICKETS READY
+
 ## Summary
 
 Implement the subscription broker that enables catch-up-then-live subscriptions. The broker uses a `tokio::broadcast` channel to push newly appended events to all active subscribers. Subscribers receive historical events from the in-memory index (catch-up phase), a `CaughtUp` marker, and then live events from the broadcast channel (live phase). This PRD covers both `SubscribeAll` and `SubscribeStream` semantics.

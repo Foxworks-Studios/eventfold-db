@@ -1,5 +1,6 @@
 //! EventfoldDB: a lightweight, single-node event store for event sourcing and CQRS.
 
+pub mod broker;
 pub mod codec;
 pub mod error;
 pub mod reader;
@@ -7,12 +8,14 @@ pub mod store;
 pub mod types;
 pub mod writer;
 
+pub use broker::{Broker, subscribe_all, subscribe_stream};
 pub use codec::DecodeOutcome;
 pub use error::Error;
 pub use reader::ReadIndex;
 pub use store::Store;
 pub use types::{
     ExpectedVersion, MAX_EVENT_SIZE, MAX_EVENT_TYPE_LEN, ProposedEvent, RecordedEvent,
+    SubscriptionMessage,
 };
 pub use writer::{WriterHandle, spawn_writer};
 

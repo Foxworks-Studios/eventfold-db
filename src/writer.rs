@@ -6,6 +6,7 @@
 
 use uuid::Uuid;
 
+use crate::broker::Broker;
 use crate::error::Error;
 use crate::types::{ExpectedVersion, ProposedEvent, RecordedEvent};
 
@@ -115,6 +116,10 @@ impl WriterHandle {
 /// `try_recv()` for batching. The loop exits cleanly when all senders are
 /// dropped (i.e., `rx.recv()` returns `None`).
 ///
+/// After each successful append (store.append returns Ok), the newly recorded
+/// events are published to the broker before the response is sent to the caller.
+/// Failed appends do not publish to the broker.
+///
 /// If a response receiver has been dropped before the result is sent, a
 /// `tracing::warn!` is logged and the result is discarded.
 ///
@@ -122,9 +127,11 @@ impl WriterHandle {
 ///
 /// * `store` - The storage engine that processes appends.
 /// * `rx` - Receiver half of the bounded mpsc channel carrying append requests.
+/// * `broker` - Broadcast broker for publishing newly appended events to subscribers.
 pub(crate) async fn run_writer(
     mut store: crate::store::Store,
     mut rx: tokio::sync::mpsc::Receiver<AppendRequest>,
+    broker: Broker,
 ) {
     // Block on the first request; exit when channel is closed.
     while let Some(first) = rx.recv().await {
@@ -138,6 +145,14 @@ pub(crate) async fn run_writer(
         // writes to disk, fsyncs, and updates the in-memory index.
         for req in batch {
             let result = store.append(req.stream_id, req.expected_version, req.events);
+
+            // On success, publish the recorded events to the broker before
+            // responding to the caller. This ensures subscribers see events
+            // in the same order they were written to disk.
+            if let Ok(ref recorded) = result {
+                broker.publish(recorded);
+            }
+
             // Send the result back to the caller. If the oneshot receiver was
             // already dropped (caller timed out or cancelled), log a warning.
             if req.response_tx.send(result).is_err() {
@@ -154,13 +169,14 @@ pub(crate) async fn run_writer(
 /// Spawn the writer task on the tokio runtime.
 ///
 /// Creates a bounded mpsc channel, clones the shared event log `Arc` from the
-/// store (for the `ReadIndex`), moves the store into the spawned writer task,
-/// and returns a triple of `(WriterHandle, ReadIndex, JoinHandle<()>)`.
+/// store (for the `ReadIndex`), moves the store and broker into the spawned
+/// writer task, and returns a triple of `(WriterHandle, ReadIndex, JoinHandle<()>)`.
 ///
 /// # Arguments
 ///
 /// * `store` - The storage engine to move into the writer task.
 /// * `channel_capacity` - Bound on the mpsc channel. Controls backpressure.
+/// * `broker` - Broadcast broker moved into the writer task for publishing events.
 ///
 /// # Returns
 ///
@@ -171,6 +187,7 @@ pub(crate) async fn run_writer(
 pub fn spawn_writer(
     store: crate::store::Store,
     channel_capacity: usize,
+    broker: Broker,
 ) -> (
     WriterHandle,
     crate::reader::ReadIndex,
@@ -183,7 +200,7 @@ pub fn spawn_writer(
     let (tx, rx) = tokio::sync::mpsc::channel(channel_capacity);
     let writer_handle = WriterHandle::new(tx);
 
-    let join_handle = tokio::spawn(run_writer(store, rx));
+    let join_handle = tokio::spawn(run_writer(store, rx, broker));
 
     (writer_handle, read_index, join_handle)
 }
@@ -349,7 +366,8 @@ mod tests {
     #[tokio::test]
     async fn ac1_basic_append_through_writer() {
         let (store, _dir) = temp_store();
-        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8);
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
 
         let stream_id = uuid::Uuid::new_v4();
         let result = handle
@@ -372,7 +390,8 @@ mod tests {
     #[tokio::test]
     async fn ac2_sequential_appends_have_contiguous_positions() {
         let (store, _dir) = temp_store();
-        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8);
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
 
         let stream_id = uuid::Uuid::new_v4();
 
@@ -419,7 +438,8 @@ mod tests {
     #[tokio::test]
     async fn ac3_concurrent_appends_serialized() {
         let (store, _dir) = temp_store();
-        let (handle, _read_index, join_handle) = super::spawn_writer(store, 16);
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 16, crate::broker::Broker::new(64));
 
         let mut tasks = Vec::with_capacity(10);
         for _ in 0..10 {
@@ -453,7 +473,8 @@ mod tests {
     #[tokio::test]
     async fn ac4a_nostream_twice_returns_wrong_expected_version() {
         let (store, _dir) = temp_store();
-        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8);
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
 
         let stream_id = uuid::Uuid::new_v4();
         handle
@@ -487,7 +508,8 @@ mod tests {
     #[tokio::test]
     async fn ac4b_exact_0_after_nostream_succeeds() {
         let (store, _dir) = temp_store();
-        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8);
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
 
         let stream_id = uuid::Uuid::new_v4();
         handle
@@ -515,7 +537,8 @@ mod tests {
     #[tokio::test]
     async fn ac4c_exact_5_after_nostream_returns_wrong_expected_version() {
         let (store, _dir) = temp_store();
-        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8);
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
 
         let stream_id = uuid::Uuid::new_v4();
         handle
@@ -549,7 +572,8 @@ mod tests {
     #[tokio::test]
     async fn ac5_read_index_reflects_writes() {
         let (store, _dir) = temp_store();
-        let (handle, read_index, join_handle) = super::spawn_writer(store, 8);
+        let (handle, read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
 
         let stream_id = uuid::Uuid::new_v4();
         for i in 0..3u64 {
@@ -590,7 +614,8 @@ mod tests {
         // First run: append 5 events and shut down cleanly.
         {
             let store = crate::store::Store::open(&path).expect("open should succeed");
-            let (handle, _read_index, join_handle) = super::spawn_writer(store, 8);
+            let (handle, _read_index, join_handle) =
+                super::spawn_writer(store, 8, crate::broker::Broker::new(64));
 
             let stream_id = uuid::Uuid::new_v4();
             for _ in 0..5u64 {
@@ -625,7 +650,8 @@ mod tests {
     #[tokio::test]
     async fn ac7_graceful_shutdown_on_handle_drop() {
         let (store, _dir) = temp_store();
-        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8);
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
 
         // Drop all WriterHandle clones. This closes the channel.
         drop(handle);
@@ -641,7 +667,8 @@ mod tests {
     #[tokio::test]
     async fn ac8_backpressure_bounded_channel() {
         let (store, _dir) = temp_store();
-        let (handle, _read_index, join_handle) = super::spawn_writer(store, 1);
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 1, crate::broker::Broker::new(64));
 
         // With capacity=1, the channel holds exactly one message. Fill it
         // using try_send (synchronous, non-blocking) to avoid yielding to
@@ -681,7 +708,8 @@ mod tests {
     #[tokio::test]
     async fn ac9a_event_too_large_returns_error() {
         let (store, _dir) = temp_store();
-        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8);
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
 
         // Create an event whose payload exceeds MAX_EVENT_SIZE (64 KB).
         let oversized_payload = bytes::Bytes::from(vec![0u8; crate::types::MAX_EVENT_SIZE + 1]);
@@ -712,7 +740,8 @@ mod tests {
     #[tokio::test]
     async fn ac9b_writer_not_poisoned_after_error() {
         let (store, _dir) = temp_store();
-        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8);
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64));
 
         // First: send an oversized event that fails.
         let oversized_payload = bytes::Bytes::from(vec![0u8; crate::types::MAX_EVENT_SIZE + 1]);
@@ -741,6 +770,121 @@ mod tests {
             )
             .await;
         assert!(ok_result.is_ok(), "valid append after error should succeed");
+
+        drop(handle);
+        join_handle.await.expect("writer task should exit cleanly");
+    }
+
+    // --- Broker integration tests (PRD 005, Ticket 3) ---
+
+    #[tokio::test]
+    async fn ac13_writer_publishes_to_broker() {
+        use crate::broker::Broker;
+        use std::sync::Arc;
+
+        let (store, _dir) = temp_store();
+        let broker = Broker::new(64);
+        let mut rx = broker.subscribe();
+
+        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8, broker);
+
+        let stream_id = uuid::Uuid::new_v4();
+        handle
+            .append(
+                stream_id,
+                crate::types::ExpectedVersion::NoStream,
+                vec![proposed("BrokerEvent")],
+            )
+            .await
+            .expect("append should succeed");
+
+        let received: Arc<crate::types::RecordedEvent> =
+            rx.recv().await.expect("should receive event from broker");
+        assert_eq!(received.event_type, "BrokerEvent");
+
+        drop(handle);
+        join_handle.await.expect("writer task should exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn broker_receives_three_events_in_order() {
+        use crate::broker::Broker;
+
+        let (store, _dir) = temp_store();
+        let broker = Broker::new(64);
+        let mut rx = broker.subscribe();
+
+        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8, broker);
+
+        let stream_id = uuid::Uuid::new_v4();
+        for i in 0u64..3 {
+            let ev = if i == 0 {
+                crate::types::ExpectedVersion::NoStream
+            } else {
+                crate::types::ExpectedVersion::Exact(i - 1)
+            };
+            handle
+                .append(stream_id, ev, vec![proposed(&format!("Evt{i}"))])
+                .await
+                .expect("append should succeed");
+        }
+
+        // Receive 3 events and verify global positions 0, 1, 2 in order.
+        for expected_pos in 0u64..3 {
+            let received = rx.recv().await.expect("should receive event");
+            assert_eq!(
+                received.global_position, expected_pos,
+                "expected position {expected_pos}, got {}",
+                received.global_position
+            );
+        }
+
+        drop(handle);
+        join_handle.await.expect("writer task should exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn failed_append_does_not_publish_to_broker() {
+        use crate::broker::Broker;
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let (store, _dir) = temp_store();
+        let broker = Broker::new(64);
+        let mut rx = broker.subscribe();
+
+        let (handle, _read_index, join_handle) = super::spawn_writer(store, 8, broker);
+
+        let stream_id = uuid::Uuid::new_v4();
+
+        // First: succeed with NoStream to create the stream.
+        handle
+            .append(
+                stream_id,
+                crate::types::ExpectedVersion::NoStream,
+                vec![proposed("First")],
+            )
+            .await
+            .expect("first append should succeed");
+
+        // Drain the one successful event from the broker.
+        let _ = rx.recv().await.expect("should receive the first event");
+
+        // Second: attempt a conflicting append (NoStream again) -- must fail.
+        let result = handle
+            .append(
+                stream_id,
+                crate::types::ExpectedVersion::NoStream,
+                vec![proposed("Conflict")],
+            )
+            .await;
+        assert!(result.is_err(), "conflicting append should fail");
+
+        // The broker should NOT have received anything from the failed append.
+        assert_eq!(
+            rx.try_recv(),
+            Err(TryRecvError::Empty),
+            "broker should have no events from failed append"
+        );
 
         drop(handle);
         join_handle.await.expect("writer task should exit cleanly");
