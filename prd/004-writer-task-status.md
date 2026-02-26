@@ -4,7 +4,7 @@
 **Tickets:** prd/004-writer-task-tickets.md
 **Started:** 2026-02-25
 **Last Updated:** 2026-02-25
-**Overall Status:** IN PROGRESS
+**Overall Status:** QA READY
 
 ---
 
@@ -16,8 +16,8 @@
 | 2 | `EventLog` shared state + `Store` refactor | DONE | ticket-02-impl.md | ticket-02-review.md | APPROVED |
 | 3 | `ReadIndex` shared read-only view | DONE | ticket-03-impl.md | ticket-03-review.md | APPROVED |
 | 4 | `AppendRequest` + `WriterHandle` types | DONE | ticket-04-impl.md | ticket-04-review.md | APPROVED |
-| 5 | `run_writer` + `spawn_writer` | IN PROGRESS | -- | -- | |
-| 6 | Verification and integration | TODO | -- | -- | |
+| 5 | `run_writer` + `spawn_writer` | DONE | ticket-05-impl.md | ticket-05-review.md | APPROVED |
+| 6 | Verification and integration | DONE | ticket-06-impl.md | (skipped: verification) | |
 
 ## Prior Work Summary
 
@@ -44,4 +44,20 @@
 
 ## Completion Report
 
-(pending)
+**Completed:** 2026-02-25
+**Tickets Completed:** 6/6
+
+### Summary of Changes
+- `Cargo.toml`: added `tokio = { version = "1", features = ["full"] }`
+- `src/store.rs`: introduced `EventLog` struct, refactored `Store` to use `Arc<RwLock<EventLog>>`
+- `src/reader.rs`: new module with `ReadIndex` (shared read-only view of in-memory index)
+- `src/writer.rs`: new module with `AppendRequest`, `WriterHandle`, `run_writer`, `spawn_writer`
+- `src/lib.rs`: re-exports `ReadIndex`, `WriterHandle`, `spawn_writer`, `EventLog`
+- `tests/writer_integration.rs`: end-to-end integration test exercising full public API
+- 113 tests total (87 pre-existing + 26 new), all green
+- All quality gates pass: build, clippy, fmt, test
+
+### Known Issues / Follow-Up
+- None
+
+### Ready for QA: YES
