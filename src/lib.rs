@@ -4,6 +4,8 @@ pub mod broker;
 pub mod codec;
 pub(crate) mod dedup;
 pub mod error;
+/// Prometheus metrics infrastructure for EventfoldDB.
+pub mod metrics;
 /// Generated protobuf types for the EventfoldDB gRPC API.
 pub mod proto {
     tonic::include_proto!("eventfold");

@@ -33,6 +33,7 @@ struct TlsConfig {
 /// | `EVENTFOLD_TLS_CERT`        | No       | --           | PEM cert path (enables TLS)          |
 /// | `EVENTFOLD_TLS_KEY`         | No       | --           | PEM key path (required with CERT)    |
 /// | `EVENTFOLD_TLS_CA`          | No       | --           | PEM CA path (enables mTLS)           |
+/// | `EVENTFOLD_METRICS_LISTEN`  | No       | `[::]:9090`  | Metrics HTTP address; empty disables |
 #[derive(Debug, Clone, PartialEq)]
 struct Config {
     /// Path to the append-only event log file.
@@ -45,6 +46,9 @@ struct Config {
     dedup_capacity: NonZeroUsize,
     /// Optional TLS configuration. `None` means plaintext mode.
     tls: Option<TlsConfig>,
+    /// Socket address for the Prometheus metrics HTTP endpoint.
+    /// `None` disables the metrics endpoint entirely.
+    metrics_listen: Option<SocketAddr>,
 }
 
 /// Default socket address the server listens on when `EVENTFOLD_LISTEN` is not set.
@@ -55,6 +59,9 @@ const DEFAULT_BROKER_CAPACITY: usize = 4096;
 
 /// Default dedup capacity when `EVENTFOLD_DEDUP_CAPACITY` is not set.
 const DEFAULT_DEDUP_CAPACITY: usize = 65536;
+
+/// Default metrics listen address when `EVENTFOLD_METRICS_LISTEN` is not set.
+const DEFAULT_METRICS_LISTEN_ADDR: &str = "[::]:9090";
 
 impl Config {
     /// Parse server configuration from environment variables.
@@ -67,6 +74,8 @@ impl Config {
     ///   `4096`.
     /// * `EVENTFOLD_DEDUP_CAPACITY` (optional) - Max event IDs in dedup index. Defaults to
     ///   `65536`.
+    /// * `EVENTFOLD_METRICS_LISTEN` (optional) - Metrics HTTP address. Defaults to `[::]:9090`.
+    ///   Set to `""` to disable.
     ///
     /// # Errors
     ///
@@ -75,6 +84,7 @@ impl Config {
     /// - `EVENTFOLD_LISTEN` is set but not a valid `SocketAddr`
     /// - `EVENTFOLD_BROKER_CAPACITY` is set but not a valid `usize`
     /// - `EVENTFOLD_DEDUP_CAPACITY` is set but not a valid nonzero `usize`
+    /// - `EVENTFOLD_METRICS_LISTEN` is set to a non-empty invalid `SocketAddr` string
     /// - `EVENTFOLD_TLS_CERT` is set without `EVENTFOLD_TLS_KEY` (or vice versa)
     /// - `EVENTFOLD_TLS_CA` is set without both `EVENTFOLD_TLS_CERT` and `EVENTFOLD_TLS_KEY`
     fn from_env() -> Result<Config, String> {
@@ -108,6 +118,19 @@ impl Config {
             }
             Err(_) => NonZeroUsize::new(DEFAULT_DEDUP_CAPACITY)
                 .expect("default dedup capacity is nonzero"),
+        };
+
+        // Parse optional metrics listen address. Empty string disables metrics.
+        let metrics_listen = match std::env::var("EVENTFOLD_METRICS_LISTEN") {
+            Ok(val) if val.is_empty() => None,
+            Ok(val) => Some(val.parse::<SocketAddr>().map_err(|e| {
+                format!("EVENTFOLD_METRICS_LISTEN is not a valid socket address: {e}")
+            })?),
+            Err(_) => Some(
+                DEFAULT_METRICS_LISTEN_ADDR
+                    .parse::<SocketAddr>()
+                    .expect("default metrics listen address is valid"),
+            ),
         };
 
         // Parse optional TLS configuration from environment variables.
@@ -157,6 +180,7 @@ impl Config {
             broker_capacity,
             dedup_capacity,
             tls,
+            metrics_listen,
         })
     }
 }
@@ -244,11 +268,28 @@ async fn main() {
     let (writer_handle, read_index, join_handle) =
         spawn_writer(store, 64, broker.clone(), config.dedup_capacity);
 
-    // 7. Build the EventfoldService and health reporter.
+    // 7. Install the Prometheus metrics recorder.
+    let metrics_handle = match eventfold_db::metrics::install_recorder() {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to install metrics recorder");
+            std::process::exit(1);
+        }
+    };
+
+    // 8. Optionally start the metrics HTTP server.
+    let metrics_join_handle = if let Some(addr) = config.metrics_listen {
+        Some(eventfold_db::metrics::serve_metrics(metrics_handle, addr))
+    } else {
+        tracing::info!("Metrics endpoint disabled");
+        None
+    };
+
+    // 9. Build the EventfoldService and health reporter.
     let service = EventfoldService::new(writer_handle.clone(), read_index, broker);
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
-    // 8. Build the tonic Server, optionally with TLS.
+    // 10. Build the tonic Server, optionally with TLS.
     let mut builder = tonic::transport::Server::builder();
 
     if let Some(ref tls) = config.tls {
@@ -299,7 +340,7 @@ async fn main() {
         .add_service(health_service)
         .add_service(EventStoreServer::new(service));
 
-    // 9. Bind on the configured address.
+    // 11. Bind on the configured address.
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
         .await
         .unwrap_or_else(|e| {
@@ -317,10 +358,10 @@ async fn main() {
 
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
 
-    // 10. Log the actual bound address.
+    // 12. Log the actual bound address.
     tracing::info!("Server listening on {addr}");
 
-    // 11. Mark health service as SERVING now that the listener is bound.
+    // 13. Mark health service as SERVING now that the listener is bound.
     health_reporter
         .set_serving::<EventStoreServer<EventfoldService>>()
         .await;
@@ -328,7 +369,7 @@ async fn main() {
         .set_service_status("", tonic_health::ServingStatus::Serving)
         .await;
 
-    // 12-13. Serve until shutdown signal, then clean up.
+    // 14-15. Serve until shutdown signal, then clean up.
     // The shutdown future transitions health status to NOT_SERVING before the
     // server begins draining connections.
     server
@@ -347,8 +388,13 @@ async fn main() {
             std::process::exit(1);
         });
 
-    // Shutdown sequence: log, drop writer handle, await writer task.
+    // Shutdown sequence: log, abort metrics server, drop writer handle, await writer task.
     tracing::info!("Shutting down");
+
+    if let Some(handle) = metrics_join_handle {
+        handle.abort();
+    }
+
     drop(writer_handle);
     join_handle
         .await
@@ -368,6 +414,12 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_TLS_CA") };
     }
 
+    /// Clear the metrics-related environment variable so it does not leak between tests.
+    fn clear_metrics_env() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::remove_var("EVENTFOLD_METRICS_LISTEN") };
+    }
+
     #[test]
     #[serial]
     fn from_env_defaults_when_only_data_set() {
@@ -377,6 +429,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
+        clear_metrics_env();
 
         let config = Config::from_env().expect("should succeed with EVENTFOLD_DATA set");
         assert_eq!(config.data_path, PathBuf::from("/tmp/x"));
@@ -397,6 +450,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
+        clear_metrics_env();
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err when EVENTFOLD_DATA is unset");
@@ -416,6 +470,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
+        clear_metrics_env();
 
         let config = Config::from_env().expect("should succeed");
         assert_eq!(
@@ -433,6 +488,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_BROKER_CAPACITY", "16") };
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
+        clear_metrics_env();
 
         let config = Config::from_env().expect("should succeed");
         assert_eq!(config.broker_capacity, 16);
@@ -447,6 +503,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
+        clear_metrics_env();
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err for invalid listen address");
@@ -468,6 +525,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_BROKER_CAPACITY", "not-a-number") };
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
+        clear_metrics_env();
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err for invalid broker capacity");
@@ -482,6 +540,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
         clear_tls_env();
+        clear_metrics_env();
 
         let config = Config::from_env().expect("should succeed without TLS vars");
         assert_eq!(config.tls, None);
@@ -498,6 +557,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_TLS_CERT") };
         unsafe { std::env::remove_var("EVENTFOLD_TLS_KEY") };
         unsafe { std::env::set_var("EVENTFOLD_TLS_CA", "/tmp/ca.crt") };
+        clear_metrics_env();
 
         let result = Config::from_env();
         assert!(
@@ -526,6 +586,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_TLS_CERT") };
         unsafe { std::env::set_var("EVENTFOLD_TLS_KEY", "/tmp/k.key") };
         unsafe { std::env::remove_var("EVENTFOLD_TLS_CA") };
+        clear_metrics_env();
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err when CERT is missing");
@@ -547,6 +608,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_TLS_CERT", "/tmp/c.crt") };
         unsafe { std::env::remove_var("EVENTFOLD_TLS_KEY") };
         unsafe { std::env::remove_var("EVENTFOLD_TLS_CA") };
+        clear_metrics_env();
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err when KEY is missing");
@@ -568,6 +630,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_TLS_CERT", "/tmp/c.crt") };
         unsafe { std::env::set_var("EVENTFOLD_TLS_KEY", "/tmp/k.key") };
         unsafe { std::env::set_var("EVENTFOLD_TLS_CA", "/tmp/ca.crt") };
+        clear_metrics_env();
 
         let config = Config::from_env().expect("should succeed with cert, key, and CA");
         assert_eq!(
@@ -591,6 +654,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_TLS_CERT", "/tmp/c.crt") };
         unsafe { std::env::set_var("EVENTFOLD_TLS_KEY", "/tmp/k.key") };
         unsafe { std::env::remove_var("EVENTFOLD_TLS_CA") };
+        clear_metrics_env();
 
         let config = Config::from_env().expect("should succeed with cert and key");
         assert_eq!(
@@ -620,6 +684,7 @@ mod tests {
             .env("EVENTFOLD_TLS_KEY", "/tmp/nonexistent-key.pem")
             .env_remove("EVENTFOLD_TLS_CA")
             .env_remove("EVENTFOLD_BROKER_CAPACITY")
+            .env_remove("EVENTFOLD_METRICS_LISTEN")
             .output()
             .expect("failed to execute cargo run");
 
@@ -667,6 +732,7 @@ mod tests {
             .env_remove("EVENTFOLD_TLS_CERT")
             .env_remove("EVENTFOLD_TLS_KEY")
             .env_remove("EVENTFOLD_TLS_CA")
+            .env_remove("EVENTFOLD_METRICS_LISTEN")
             .output()
             .expect("failed to execute cargo run");
 
@@ -679,6 +745,80 @@ mod tests {
         assert!(
             stderr.contains("EVENTFOLD_DATA"),
             "stderr should mention EVENTFOLD_DATA, got: {stderr}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_metrics_listen_default() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
+        unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
+        unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        clear_tls_env();
+        clear_metrics_env();
+
+        let config = Config::from_env().expect("should succeed");
+        assert_eq!(
+            config.metrics_listen,
+            Some("[::]:9090".parse::<SocketAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_metrics_listen_empty_string_gives_none() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
+        unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
+        unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        clear_tls_env();
+        unsafe { std::env::set_var("EVENTFOLD_METRICS_LISTEN", "") };
+
+        let config = Config::from_env().expect("should succeed");
+        assert_eq!(config.metrics_listen, None);
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_metrics_listen_custom_addr() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
+        unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
+        unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        clear_tls_env();
+        unsafe { std::env::set_var("EVENTFOLD_METRICS_LISTEN", "127.0.0.1:19090") };
+
+        let config = Config::from_env().expect("should succeed");
+        assert_eq!(
+            config.metrics_listen,
+            Some("127.0.0.1:19090".parse::<SocketAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_metrics_listen_invalid_addr() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
+        unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
+        unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        clear_tls_env();
+        unsafe { std::env::set_var("EVENTFOLD_METRICS_LISTEN", "not-an-addr") };
+
+        let result = Config::from_env();
+        assert!(
+            result.is_err(),
+            "expected Err for invalid metrics listen address"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("EVENTFOLD_METRICS_LISTEN"),
+            "error should mention EVENTFOLD_METRICS_LISTEN, got: {msg}"
         );
     }
 }

@@ -573,6 +573,22 @@ impl Store {
         Ok(recorded)
     }
 
+    /// Returns the current byte length of the log file.
+    ///
+    /// Called after each successful append to update the `eventfold_log_bytes` gauge.
+    /// Uses `File::metadata()` which issues a `stat(2)` syscall without seeking.
+    ///
+    /// # Returns
+    ///
+    /// The file size in bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the metadata syscall fails.
+    pub fn log_file_len(&self) -> Result<u64, Error> {
+        Ok(self.file.metadata()?.len())
+    }
+
     /// Returns a clone of the shared `Arc<RwLock<EventLog>>`.
     ///
     /// This allows external components (such as `ReadIndex`) to hold a reference
@@ -2211,5 +2227,45 @@ mod tests {
             );
             assert_eq!(event.stream_id, stream_id);
         }
+    }
+
+    // --- log_file_len tests (PRD 013, Ticket 2) ---
+
+    #[test]
+    fn log_file_len_fresh_store_returns_at_least_header_size() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+        let store = Store::open(&path).expect("open should succeed");
+
+        let len = store.log_file_len().expect("log_file_len should succeed");
+        assert!(
+            len >= 8,
+            "fresh store log file length should be >= 8 (header size), got {len}"
+        );
+    }
+
+    #[test]
+    fn log_file_len_grows_after_append() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+        let mut store = Store::open(&path).expect("open should succeed");
+
+        let before = store.log_file_len().expect("log_file_len before append");
+
+        let proposed = ProposedEvent {
+            event_id: Uuid::new_v4(),
+            event_type: "TestEvent".to_string(),
+            metadata: Bytes::new(),
+            payload: Bytes::from_static(b"{}"),
+        };
+        store
+            .append(Uuid::new_v4(), ExpectedVersion::Any, vec![proposed])
+            .expect("append should succeed");
+
+        let after = store.log_file_len().expect("log_file_len after append");
+        assert!(
+            after > before,
+            "log file should grow after append: before={before}, after={after}"
+        );
     }
 }

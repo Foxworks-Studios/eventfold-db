@@ -6,7 +6,9 @@
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
+use std::time::Instant;
 
+use metrics::{counter, gauge, histogram};
 use uuid::Uuid;
 
 use crate::broker::Broker;
@@ -211,10 +213,38 @@ pub(crate) async fn run_writer(
             }
 
             // Step 2: Not a dedup hit -- perform the actual append.
+            let start = Instant::now();
             let result = store.append(req.stream_id, req.expected_version, req.events);
 
-            // On success, record in dedup index first, then publish to broker.
+            // On success: update metrics, record in dedup index, then publish
+            // to broker. Failed appends do not update any metric.
             if let Ok(ref recorded) = result {
+                let elapsed = start.elapsed();
+                histogram!("eventfold_append_duration_seconds").record(elapsed.as_secs_f64());
+                counter!("eventfold_appends_total").increment(1);
+                counter!("eventfold_events_total").increment(recorded.len() as u64);
+
+                // Stream count from the in-memory index.
+                {
+                    let log = store.log();
+                    let log_guard = log.read().expect("EventLog RwLock poisoned");
+                    gauge!("eventfold_streams_total").set(log_guard.streams.len() as f64);
+                }
+
+                // Log file size on disk.
+                match store.log_file_len() {
+                    Ok(len) => gauge!("eventfold_log_bytes").set(len as f64),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "failed to read log file length for metrics"
+                    ),
+                }
+
+                // Global head position (one past the last recorded event).
+                if let Some(last) = recorded.last() {
+                    gauge!("eventfold_global_position").set((last.global_position + 1) as f64);
+                }
+
                 dedup.record(recorded.clone());
                 broker.publish(recorded);
             }
@@ -1156,5 +1186,97 @@ mod tests {
 
         drop(handle);
         join_handle.await.expect("writer task should exit cleanly");
+    }
+
+    // --- Metrics integration test (PRD 013, Ticket 2 AC 11) ---
+
+    /// Parse a Prometheus counter value from rendered text output.
+    ///
+    /// Scans each line for `<metric_name> <value>` and returns the parsed `u64`.
+    /// Returns `None` if the metric is not present or cannot be parsed.
+    fn parse_counter(rendered: &str, metric_name: &str) -> Option<u64> {
+        for line in rendered.lines() {
+            // Skip comment lines (# TYPE, # HELP).
+            if line.starts_with('#') {
+                continue;
+            }
+            // Counter lines are formatted as "<metric_name> <value>" where
+            // value is an integer or float (e.g., "3" or "3.0").
+            if let Some(rest) = line.strip_prefix(metric_name) {
+                // Ensure the match is exact (not a prefix of a longer name).
+                let rest = rest.trim_start();
+                if rest.is_empty() || rest.starts_with('{') || rest.as_bytes()[0].is_ascii_digit() {
+                    let value_str = if rest.starts_with('{') {
+                        // Has labels: "metric{label="val"} 3"
+                        rest.split('}').nth(1).map(|s| s.trim())
+                    } else {
+                        Some(rest.trim())
+                    };
+                    if let Some(s) = value_str {
+                        // Handle float representation (e.g., "3.0" -> 3).
+                        return s.parse::<f64>().ok().map(|f| f as u64);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ac11_writer_metrics_appends_and_events_total() {
+        // Ensure the global recorder is installed. Tolerates AlreadyInstalled
+        // from other tests in this process (OnceLock guard).
+        let _ = crate::metrics::install_recorder();
+        let metrics_handle = crate::metrics::get_installed_handle()
+            .expect("recorder should be installed after install_recorder()");
+
+        // Snapshot BEFORE: capture current counter values so we can compute
+        // deltas. This makes the test resilient to process-global metric
+        // accumulation from other tests running in the same process.
+        let before = metrics_handle.render();
+        let appends_before = parse_counter(&before, "eventfold_appends_total").unwrap_or(0);
+        let events_before = parse_counter(&before, "eventfold_events_total").unwrap_or(0);
+
+        // Set up the writer and append 3 events (one per request).
+        let (store, _dir) = temp_store();
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), test_dedup_cap());
+
+        let stream_id = uuid::Uuid::new_v4();
+        for i in 0u64..3 {
+            let ev = if i == 0 {
+                crate::types::ExpectedVersion::NoStream
+            } else {
+                crate::types::ExpectedVersion::Exact(i - 1)
+            };
+            handle
+                .append(stream_id, ev, vec![proposed("MetricsEvt")])
+                .await
+                .expect("append should succeed");
+        }
+
+        // Shut down the writer so all metrics are flushed.
+        drop(handle);
+        join_handle.await.expect("writer task should exit cleanly");
+
+        // Snapshot AFTER and compute deltas.
+        let after = metrics_handle.render();
+        let appends_after = parse_counter(&after, "eventfold_appends_total")
+            .expect("eventfold_appends_total should be present in rendered metrics");
+        let events_after = parse_counter(&after, "eventfold_events_total")
+            .expect("eventfold_events_total should be present in rendered metrics");
+
+        let appends_delta = appends_after - appends_before;
+        let events_delta = events_after - events_before;
+
+        assert_eq!(
+            appends_delta, 3,
+            "expected 3 new appends, got delta {appends_delta} (before={appends_before}, after={appends_after})"
+        );
+        assert_eq!(
+            events_delta, 3,
+            "expected 3 new events, got delta {events_delta} (before={events_before}, after={events_after})"
+        );
     }
 }

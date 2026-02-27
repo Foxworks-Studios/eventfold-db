@@ -10,6 +10,7 @@
 #![allow(clippy::result_large_err)]
 
 use bytes::Bytes;
+use metrics::{counter, gauge};
 use uuid::Uuid;
 
 use futures_core::Stream;
@@ -119,6 +120,7 @@ impl proto::event_store_server::EventStore for EventfoldService {
         &self,
         request: tonic::Request<proto::ReadStreamRequest>,
     ) -> Result<tonic::Response<proto::ReadStreamResponse>, tonic::Status> {
+        counter!("eventfold_reads_total", "rpc" => "read_stream").increment(1);
         let req = request.into_inner();
 
         let stream_id = parse_uuid(&req.stream_id, "stream_id")?;
@@ -141,6 +143,7 @@ impl proto::event_store_server::EventStore for EventfoldService {
         &self,
         request: tonic::Request<proto::ReadAllRequest>,
     ) -> Result<tonic::Response<proto::ReadAllResponse>, tonic::Status> {
+        counter!("eventfold_reads_total", "rpc" => "read_all").increment(1);
         let req = request.into_inner();
 
         let events = self.read_index.read_all(req.from_position, req.max_count);
@@ -169,6 +172,10 @@ impl proto::event_store_server::EventStore for EventfoldService {
         let broker = self.broker.clone();
 
         let mapped = async_stream::stream! {
+            // Guard increments the gauge now and decrements it on drop (including
+            // when the client disconnects mid-stream).
+            let _guard = SubscriptionGauge::new();
+
             let inner = crate::subscribe_all(read_index, &broker, req.from_position).await;
             tokio::pin!(inner);
 
@@ -224,6 +231,10 @@ impl proto::event_store_server::EventStore for EventfoldService {
         let broker = self.broker.clone();
 
         let mapped = async_stream::stream! {
+            // Guard increments the gauge now and decrements it on drop (including
+            // when the client disconnects mid-stream).
+            let _guard = SubscriptionGauge::new();
+
             let inner = crate::subscribe_stream(
                 read_index, &broker, stream_id, req.from_version,
             ).await;
@@ -259,6 +270,28 @@ impl proto::event_store_server::EventStore for EventfoldService {
         };
 
         Ok(tonic::Response::new(Box::pin(mapped)))
+    }
+}
+
+/// RAII guard that increments the `eventfold_subscriptions_active` gauge on
+/// creation and decrements it on drop.
+///
+/// This guarantees the gauge is decremented even when a client disconnects
+/// mid-stream, because the drop runs when the stream's async generator is
+/// dropped by the tonic runtime.
+struct SubscriptionGauge;
+
+impl SubscriptionGauge {
+    /// Create a new guard, incrementing the active subscriptions gauge by 1.
+    fn new() -> Self {
+        gauge!("eventfold_subscriptions_active").increment(1.0);
+        Self
+    }
+}
+
+impl Drop for SubscriptionGauge {
+    fn drop(&mut self) {
+        gauge!("eventfold_subscriptions_active").decrement(1.0);
     }
 }
 
@@ -395,6 +428,7 @@ pub fn proto_to_proposed_event(p: proto::ProposedEvent) -> Result<ProposedEvent,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     // -- error_to_status tests --
 
@@ -585,5 +619,248 @@ mod tests {
         assert_eq!(proto_event.event_type, "PaymentReceived");
         assert_eq!(proto_event.metadata, b"meta");
         assert_eq!(proto_event.payload, b"payload");
+    }
+
+    // -- metrics tests --
+
+    /// Helper: ensure the global metrics recorder is installed and return its handle.
+    ///
+    /// Because the recorder is global and static, only the first call installs it.
+    /// Subsequent calls retrieve the existing handle.
+    fn ensure_metrics_handle() -> crate::metrics::MetricsHandle {
+        let _ = crate::metrics::install_recorder();
+        crate::metrics::get_installed_handle().expect("metrics recorder should be installed")
+    }
+
+    /// Helper: create a minimal `EventfoldService` backed by a temp store.
+    ///
+    /// Returns `(service, _temp_dir)`. The `_temp_dir` must be kept alive for
+    /// the duration of the test to prevent cleanup.
+    fn temp_service() -> (EventfoldService, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+        let store = crate::store::Store::open(&path).expect("open should succeed");
+        let broker = crate::broker::Broker::new(1024);
+        let dedup_cap = std::num::NonZeroUsize::new(128).expect("nonzero");
+        let (writer_handle, read_index, _join_handle) =
+            crate::writer::spawn_writer(store, 64, broker.clone(), dedup_cap);
+        let service = EventfoldService::new(writer_handle, read_index, broker);
+        (service, dir)
+    }
+
+    /// Extract the numeric value for a metric line from Prometheus-format text.
+    ///
+    /// Searches for a line starting with `prefix` (e.g., `eventfold_reads_total{rpc="read_all"}`)
+    /// and returns its parsed `f64` value. Returns `None` if not found.
+    fn parse_metric_value(rendered: &str, prefix: &str) -> Option<f64> {
+        rendered.lines().find_map(|line| {
+            line.strip_prefix(prefix)
+                .and_then(|rest| rest.trim().parse::<f64>().ok())
+        })
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn read_handlers_increment_reads_total_counter() {
+        use crate::proto::event_store_server::EventStore;
+
+        let handle = ensure_metrics_handle();
+        let (service, _dir) = temp_service();
+
+        // Snapshot current counter values before our calls.
+        let before = handle.render();
+        let read_stream_before =
+            parse_metric_value(&before, r#"eventfold_reads_total{rpc="read_stream"} "#)
+                .unwrap_or(0.0);
+        let read_all_before =
+            parse_metric_value(&before, r#"eventfold_reads_total{rpc="read_all"} "#).unwrap_or(0.0);
+
+        // First, append one event so we have a valid stream to read from.
+        let stream_id = Uuid::new_v4();
+        let append_req = tonic::Request::new(proto::AppendRequest {
+            stream_id: stream_id.to_string(),
+            expected_version: Some(proto::ExpectedVersion {
+                kind: Some(proto::expected_version::Kind::NoStream(proto::Empty {})),
+            }),
+            events: vec![proto::ProposedEvent {
+                event_id: Uuid::new_v4().to_string(),
+                event_type: "TestEvent".to_string(),
+                metadata: vec![],
+                payload: b"{}".to_vec(),
+            }],
+        });
+        service
+            .append(append_req)
+            .await
+            .expect("append should succeed");
+
+        // Call read_stream once.
+        let rs_req = tonic::Request::new(proto::ReadStreamRequest {
+            stream_id: stream_id.to_string(),
+            from_version: 0,
+            max_count: 100,
+        });
+        service
+            .read_stream(rs_req)
+            .await
+            .expect("read_stream should succeed");
+
+        // Call read_all twice.
+        for _ in 0..2 {
+            let ra_req = tonic::Request::new(proto::ReadAllRequest {
+                from_position: 0,
+                max_count: 100,
+            });
+            service
+                .read_all(ra_req)
+                .await
+                .expect("read_all should succeed");
+        }
+
+        // Render metrics and check deltas.
+        let after = handle.render();
+        let read_stream_after =
+            parse_metric_value(&after, r#"eventfold_reads_total{rpc="read_stream"} "#)
+                .expect("read_stream counter should exist");
+        let read_all_after =
+            parse_metric_value(&after, r#"eventfold_reads_total{rpc="read_all"} "#)
+                .expect("read_all counter should exist");
+
+        assert_eq!(
+            read_stream_after - read_stream_before,
+            1.0,
+            "read_stream counter should have incremented by 1"
+        );
+        assert_eq!(
+            read_all_after - read_all_before,
+            2.0,
+            "read_all counter should have incremented by 2"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subscribe_all_increments_and_decrements_gauge() {
+        use crate::proto::event_store_server::EventStore;
+        use futures::StreamExt;
+
+        let handle = ensure_metrics_handle();
+        let (service, _dir) = temp_service();
+
+        // Snapshot gauge before.
+        let before = handle.render();
+        let gauge_before =
+            parse_metric_value(&before, "eventfold_subscriptions_active ").unwrap_or(0.0);
+
+        // Start a subscribe_all call. The returned stream increments the gauge.
+        let req = tonic::Request::new(proto::SubscribeAllRequest { from_position: 0 });
+        let response = service
+            .subscribe_all(req)
+            .await
+            .expect("subscribe_all should succeed");
+        let mut stream = response.into_inner();
+
+        // The first item from the stream is a CaughtUp marker (empty log).
+        // Poll it to ensure the stream has started and the gauge has been incremented.
+        let item = stream.next().await;
+        assert!(item.is_some(), "stream should yield CaughtUp");
+
+        // While the stream is open, the gauge should have increased by 1.
+        let during = handle.render();
+        let gauge_during = parse_metric_value(&during, "eventfold_subscriptions_active ")
+            .expect("subscriptions_active gauge should exist");
+        assert_eq!(
+            gauge_during - gauge_before,
+            1.0,
+            "gauge should be incremented while stream is open"
+        );
+
+        // Drop the stream to trigger cleanup. The async_stream block will
+        // complete and the gauge should decrement.
+        drop(stream);
+
+        // Give the runtime a moment to run the stream's cleanup path.
+        tokio::task::yield_now().await;
+
+        let after = handle.render();
+        let gauge_after = parse_metric_value(&after, "eventfold_subscriptions_active ")
+            .expect("subscriptions_active gauge should exist after drop");
+        assert_eq!(
+            gauge_after - gauge_before,
+            0.0,
+            "gauge should return to original value after stream is dropped"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn subscribe_stream_increments_and_decrements_gauge() {
+        use crate::proto::event_store_server::EventStore;
+        use futures::StreamExt;
+
+        let handle = ensure_metrics_handle();
+        let (service, _dir) = temp_service();
+
+        // Append an event to create a stream.
+        let stream_id = Uuid::new_v4();
+        let append_req = tonic::Request::new(proto::AppendRequest {
+            stream_id: stream_id.to_string(),
+            expected_version: Some(proto::ExpectedVersion {
+                kind: Some(proto::expected_version::Kind::NoStream(proto::Empty {})),
+            }),
+            events: vec![proto::ProposedEvent {
+                event_id: Uuid::new_v4().to_string(),
+                event_type: "TestEvent".to_string(),
+                metadata: vec![],
+                payload: b"{}".to_vec(),
+            }],
+        });
+        service
+            .append(append_req)
+            .await
+            .expect("append should succeed");
+
+        // Snapshot gauge before.
+        let before = handle.render();
+        let gauge_before =
+            parse_metric_value(&before, "eventfold_subscriptions_active ").unwrap_or(0.0);
+
+        // Start a subscribe_stream call.
+        let req = tonic::Request::new(proto::SubscribeStreamRequest {
+            stream_id: stream_id.to_string(),
+            from_version: 0,
+        });
+        let response = service
+            .subscribe_stream(req)
+            .await
+            .expect("subscribe_stream should succeed");
+        let mut stream = response.into_inner();
+
+        // Poll the first item (the event we appended).
+        let item = stream.next().await;
+        assert!(item.is_some(), "stream should yield the appended event");
+
+        // Gauge should have increased while stream is open.
+        let during = handle.render();
+        let gauge_during = parse_metric_value(&during, "eventfold_subscriptions_active ")
+            .expect("subscriptions_active gauge should exist");
+        assert_eq!(
+            gauge_during - gauge_before,
+            1.0,
+            "gauge should be incremented while stream is open"
+        );
+
+        // Drop the stream.
+        drop(stream);
+        tokio::task::yield_now().await;
+
+        let after = handle.render();
+        let gauge_after = parse_metric_value(&after, "eventfold_subscriptions_active ")
+            .expect("subscriptions_active gauge should exist after drop");
+        assert_eq!(
+            gauge_after - gauge_before,
+            0.0,
+            "gauge should return to original value after stream is dropped"
+        );
     }
 }
