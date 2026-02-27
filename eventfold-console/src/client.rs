@@ -307,6 +307,7 @@ mod tests {
         assert_eq!(record.stream_id, "sid-1");
         assert_eq!(record.stream_version, 5);
         assert_eq!(record.global_position, 42);
+        assert_eq!(record.recorded_at, 1_700_000_000_000);
         assert_eq!(record.event_type, "OrderPlaced");
         assert_eq!(record.metadata, vec![1, 2, 3]);
         assert_eq!(record.payload, vec![4, 5, 6]);
