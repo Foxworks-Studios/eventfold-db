@@ -169,7 +169,7 @@ mod tests {
                 ExpectedVersion::Exact(i as u64 - 1)
             };
             store
-                .append(stream_id, expected, vec![proposed("TestEvent")])
+                .append(stream_id, expected, 0, vec![proposed("TestEvent")])
                 .expect("append should succeed");
         }
         (stream_id, store, dir)
@@ -253,6 +253,7 @@ mod tests {
             .append(
                 stream_id,
                 ExpectedVersion::NoStream,
+                0,
                 vec![proposed("Created")],
             )
             .expect("append should succeed");

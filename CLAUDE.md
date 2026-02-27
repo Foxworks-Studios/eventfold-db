@@ -64,7 +64,7 @@ docs/
 - Maximum event size is 64 KB (payload + metadata + fixed fields). Large blobs belong in external storage (S3, etc.); events carry references, not files.
 - Event type tags are UTF-8 strings, max 256 bytes.
 - Payload = domain event body (the facts). Metadata = infrastructure context (correlation ID, causation ID, client timestamp, user identity). Both are opaque bytes to the store.
-- The server does not assign timestamps. Ordering uses global position and stream version only. Timestamps are a client concern, carried in metadata or payload.
+- The server assigns `recorded_at` (Unix epoch milliseconds, u64) to every event at append time. All events in a single batch share the same `recorded_at`. Ordering still uses global position and stream version; `recorded_at` is informational.
 - Optimistic concurrency is whole-stream, not field-level. On version conflict, the caller re-reads, re-evaluates, and retries.
 
 ### Code style

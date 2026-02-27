@@ -18,7 +18,7 @@ use crate::types::RecordedEvent;
 const MAGIC: [u8; 4] = [0x45, 0x46, 0x44, 0x42];
 
 /// Current on-disk format version.
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 /// Magic bytes identifying a batch header (ASCII "EFBB").
 pub(crate) const BATCH_HEADER_MAGIC: [u8; 4] = [0x45, 0x46, 0x42, 0x42];
@@ -84,7 +84,7 @@ pub struct BatchFooter {
 ///
 /// The header consists of a 4-byte magic number (`EFDB` in ASCII) followed by
 /// a 4-byte format version in little-endian encoding. The current format
-/// version is `2`.
+/// version is `3`.
 ///
 /// # Returns
 ///
@@ -99,7 +99,7 @@ pub fn encode_header() -> [u8; 8] {
 /// Decode and validate the file header.
 ///
 /// Checks that the magic number matches `EFDB` and that the format version is
-/// supported (currently only version `2`).
+/// supported (currently only version `3`).
 ///
 /// # Arguments
 ///
@@ -129,9 +129,9 @@ pub fn decode_header(buf: &[u8; 8]) -> Result<u32, Error> {
 }
 
 /// Fixed-size portion of a record body (everything except variable-length fields):
-/// global_position(8) + stream_id(16) + stream_version(8) + event_id(16) +
-/// event_type_len(2) + metadata_len(4) + payload_len(4) + checksum(4) = 62.
-const FIXED_BODY_SIZE: usize = 8 + 16 + 8 + 16 + 2 + 4 + 4 + 4;
+/// global_position(8) + recorded_at(8) + stream_id(16) + stream_version(8) +
+/// event_id(16) + event_type_len(2) + metadata_len(4) + payload_len(4) + checksum(4) = 70.
+const FIXED_BODY_SIZE: usize = 8 + 8 + 16 + 8 + 16 + 2 + 4 + 4 + 4;
 
 /// Size of the length prefix field in bytes.
 const LENGTH_PREFIX_SIZE: usize = 4;
@@ -161,6 +161,7 @@ pub fn encode_record(event: &RecordedEvent) -> Vec<u8> {
 
     // -- Begin body (CRC32 covers from here through payload) --
     buf.extend_from_slice(&event.global_position.to_le_bytes());
+    buf.extend_from_slice(&event.recorded_at.to_le_bytes());
     buf.extend_from_slice(event.stream_id.as_bytes());
     buf.extend_from_slice(&event.stream_version.to_le_bytes());
     buf.extend_from_slice(event.event_id.as_bytes());
@@ -271,6 +272,10 @@ pub fn decode_record(buf: &[u8]) -> Result<DecodeOutcome<RecordedEvent>, Error> 
     let gp_bytes = read_bytes!(8);
     let global_position = u64::from_le_bytes(gp_bytes.try_into().expect("8 bytes for u64"));
 
+    // recorded_at (u64 LE, 8 bytes)
+    let ra_bytes = read_bytes!(8);
+    let recorded_at = u64::from_le_bytes(ra_bytes.try_into().expect("8 bytes for u64"));
+
     // stream_id (UUID raw bytes, 16 bytes)
     let sid_bytes = read_bytes!(16);
     let stream_id = Uuid::from_bytes(sid_bytes.try_into().expect("16 bytes for UUID"));
@@ -316,6 +321,7 @@ pub fn decode_record(buf: &[u8]) -> Result<DecodeOutcome<RecordedEvent>, Error> 
         stream_id,
         stream_version,
         global_position,
+        recorded_at,
         event_type: event_type.to_string(),
         metadata: Bytes::copy_from_slice(meta_bytes),
         payload: Bytes::copy_from_slice(pay_bytes),
@@ -456,6 +462,7 @@ mod tests {
             stream_id: uuid::Uuid::new_v4(),
             stream_version: 0,
             global_position: 0,
+            recorded_at: 0,
             event_type: "TestEvent".to_string(),
             metadata: bytes::Bytes::new(),
             payload: bytes::Bytes::from_static(b"{}"),
@@ -496,6 +503,7 @@ mod tests {
             stream_id: uuid::Uuid::new_v4(),
             stream_version,
             global_position,
+            recorded_at: 1_000_000_000_000,
             event_type: event_type.to_string(),
             metadata: bytes::Bytes::copy_from_slice(metadata),
             payload: bytes::Bytes::copy_from_slice(payload),
@@ -772,9 +780,10 @@ mod tests {
         let mut buf = encode_record(&event);
 
         // The event_type region: after record_length (4) + global_position (8) +
-        // stream_id (16) + stream_version (8) + event_id (16) + event_type_len (2) = offset 54.
-        // The event_type is 2 bytes ("AB") at offsets 54..56.
-        let et_offset = 4 + 8 + 16 + 8 + 16 + 2; // = 54
+        // recorded_at (8) + stream_id (16) + stream_version (8) + event_id (16) +
+        // event_type_len (2) = offset 62.
+        // The event_type is 2 bytes ("AB") at offsets 62..64.
+        let et_offset = 4 + 8 + 8 + 16 + 8 + 16 + 2; // = 62
         // Replace with invalid UTF-8
         buf[et_offset] = 0xFF;
         buf[et_offset + 1] = 0xFE;
@@ -806,18 +815,18 @@ mod tests {
     }
 
     #[test]
-    fn encode_header_bytes_4_to_8_are_version_2_le() {
+    fn encode_header_bytes_4_to_8_are_version_3_le() {
         let header = encode_header();
-        assert_eq!(&header[4..8], &2u32.to_le_bytes());
+        assert_eq!(&header[4..8], &3u32.to_le_bytes());
     }
 
     // AC-2: Header decoding
 
     #[test]
-    fn decode_header_round_trip_returns_version_2() {
+    fn decode_header_round_trip_returns_version_3() {
         let header = encode_header();
         let version = decode_header(&header).expect("valid header should decode");
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]
@@ -944,9 +953,77 @@ mod tests {
     }
 
     #[test]
-    fn decode_header_accepts_version_2() {
+    fn decode_header_rejects_version_2() {
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&[0x45, 0x46, 0x44, 0x42]);
+        buf[4..8].copy_from_slice(&2u32.to_le_bytes());
+        let err = decode_header(&buf).expect_err("version 2 should be rejected");
+        match err {
+            Error::InvalidHeader(msg) => {
+                assert!(
+                    msg.contains("version"),
+                    "error message should mention 'version', got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidHeader, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_header_accepts_version_3() {
         let header = encode_header();
-        let version = decode_header(&header).expect("version 2 header should decode");
-        assert_eq!(version, 2);
+        let version = decode_header(&header).expect("version 3 header should decode");
+        assert_eq!(version, 3);
+    }
+
+    // -- PRD 017, Ticket 2: recorded_at in codec v3 --
+
+    #[test]
+    fn round_trip_preserves_recorded_at() {
+        let mut event = make_event(0, 0, "TimestampTest", b"meta", b"payload");
+        event.recorded_at = 1_700_000_000_000;
+        let buf = encode_record(&event);
+        let result = decode_record(&buf).expect("decode should succeed");
+        match result {
+            DecodeOutcome::Complete { value: decoded, .. } => {
+                assert_eq!(decoded.recorded_at, 1_700_000_000_000);
+                assert_eq!(decoded, event);
+            }
+            DecodeOutcome::Incomplete => panic!("expected Complete, got Incomplete"),
+        }
+    }
+
+    #[test]
+    fn flipped_recorded_at_bit_returns_corrupt_record() {
+        let mut event = make_event(0, 0, "BitFlipTest", b"meta", b"payload");
+        event.recorded_at = 1_700_000_000_000;
+        let mut buf = encode_record(&event);
+        // recorded_at is at bytes 12..20 (after 4-byte length prefix + 8-byte
+        // global_position). Flip one bit in the recorded_at region.
+        buf[12] ^= 0x01;
+        let result = decode_record(&buf);
+        assert!(
+            matches!(result, Err(Error::CorruptRecord { .. })),
+            "expected CorruptRecord, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn recorded_at_bytes_at_correct_offset() {
+        let mut event = make_event(0, 0, "OffsetTest", b"", b"");
+        event.recorded_at = 0xDEAD_BEEF_CAFE_1234_u64;
+        let buf = encode_record(&event);
+        // recorded_at should be at bytes 12..20 (after 4-byte length prefix +
+        // 8-byte global_position).
+        assert_eq!(
+            &buf[12..20],
+            &0xDEAD_BEEF_CAFE_1234_u64.to_le_bytes(),
+            "recorded_at bytes at offset 12..20 should match to_le_bytes()"
+        );
+    }
+
+    #[test]
+    fn fixed_body_size_is_70() {
+        assert_eq!(FIXED_BODY_SIZE, 70);
     }
 }

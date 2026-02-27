@@ -293,6 +293,7 @@ mod tests {
             stream_id: Uuid::new_v4(),
             stream_version: 0,
             global_position,
+            recorded_at: 0,
             event_type: event_type.to_string(),
             metadata: Bytes::new(),
             payload: Bytes::from_static(b"{}"),

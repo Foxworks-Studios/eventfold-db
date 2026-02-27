@@ -49,8 +49,8 @@ pub struct ProposedEvent {
 /// A persisted event with server-assigned positions.
 ///
 /// After a successful append, the server assigns a `global_position` (contiguous, zero-based
-/// index in the global log) and a `stream_version` (contiguous, zero-based index within the
-/// stream). These positions are immutable once assigned.
+/// index in the global log), a `stream_version` (contiguous, zero-based index within the
+/// stream), and a `recorded_at` timestamp. These fields are immutable once assigned.
 ///
 /// # Fields
 ///
@@ -58,6 +58,7 @@ pub struct ProposedEvent {
 /// * `stream_id` - UUID of the stream this event belongs to.
 /// * `stream_version` - Zero-based version within the stream.
 /// * `global_position` - Zero-based position in the global log.
+/// * `recorded_at` - Unix epoch milliseconds, server-assigned at append time.
 /// * `event_type` - Event type tag.
 /// * `metadata` - Opaque metadata bytes.
 /// * `payload` - Opaque payload bytes.
@@ -71,6 +72,8 @@ pub struct RecordedEvent {
     pub stream_version: u64,
     /// Zero-based position in the global log.
     pub global_position: u64,
+    /// Unix epoch milliseconds, server-assigned at append time.
+    pub recorded_at: u64,
     /// Event type tag.
     pub event_type: String,
     /// Opaque metadata bytes.
@@ -164,6 +167,7 @@ mod tests {
             stream_id,
             stream_version: 0,
             global_position: 42,
+            recorded_at: 0,
             event_type: "PaymentReceived".to_string(),
             metadata: Bytes::from_static(b"corr-123"),
             payload: Bytes::from_static(b"{\"amount\":100}"),
@@ -185,6 +189,7 @@ mod tests {
             stream_id: Uuid::new_v4(),
             stream_version: 3,
             global_position: 10,
+            recorded_at: 0,
             event_type: "Shipped".to_string(),
             metadata: Bytes::new(),
             payload: Bytes::from_static(b"{}"),
@@ -203,6 +208,7 @@ mod tests {
             stream_id,
             stream_version: 0,
             global_position: 0,
+            recorded_at: 0,
             event_type: "Created".to_string(),
             metadata: Bytes::new(),
             payload: Bytes::new(),
@@ -274,6 +280,7 @@ mod tests {
             stream_id: Uuid::new_v4(),
             stream_version: 0,
             global_position: 0,
+            recorded_at: 0,
             event_type: "TestEvent".to_string(),
             metadata: Bytes::new(),
             payload: Bytes::from_static(b"{}"),
@@ -297,6 +304,7 @@ mod tests {
             stream_id: Uuid::new_v4(),
             stream_version: 0,
             global_position: 0,
+            recorded_at: 0,
             event_type: "TestEvent".to_string(),
             metadata: Bytes::new(),
             payload: Bytes::from_static(b"{}"),
@@ -322,5 +330,59 @@ mod tests {
         let _s = stream! {
             yield 1u32;
         };
+    }
+
+    // PRD 017, Ticket 1: recorded_at field tests.
+
+    #[test]
+    fn recorded_event_recorded_at_round_trip() {
+        let event = RecordedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: Uuid::new_v4(),
+            stream_version: 0,
+            global_position: 0,
+            recorded_at: 1_700_000_000_123,
+            event_type: "TimestampTest".to_string(),
+            metadata: Bytes::new(),
+            payload: Bytes::from_static(b"{}"),
+        };
+        assert_eq!(event.recorded_at, 1_700_000_000_123);
+    }
+
+    #[test]
+    fn recorded_event_clone_preserves_recorded_at() {
+        let event = RecordedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: Uuid::new_v4(),
+            stream_version: 0,
+            global_position: 0,
+            recorded_at: 42,
+            event_type: "CloneTest".to_string(),
+            metadata: Bytes::new(),
+            payload: Bytes::from_static(b"{}"),
+        };
+        let cloned = event.clone();
+        assert_eq!(cloned.recorded_at, 42);
+    }
+
+    #[test]
+    fn recorded_events_with_different_recorded_at_are_not_equal() {
+        let event_id = Uuid::new_v4();
+        let stream_id = Uuid::new_v4();
+        let event_a = RecordedEvent {
+            event_id,
+            stream_id,
+            stream_version: 0,
+            global_position: 0,
+            recorded_at: 100,
+            event_type: "DiffTest".to_string(),
+            metadata: Bytes::new(),
+            payload: Bytes::new(),
+        };
+        let event_b = RecordedEvent {
+            recorded_at: 200,
+            ..event_a.clone()
+        };
+        assert_ne!(event_a, event_b);
     }
 }

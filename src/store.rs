@@ -425,6 +425,8 @@ impl Store {
     ///
     /// * `stream_id` - UUID of the target stream.
     /// * `expected_version` - Concurrency check against current stream state.
+    /// * `recorded_at` - Unix epoch milliseconds timestamp assigned to all events
+    ///   in this batch. Typically stamped by the writer task via `SystemTime::now()`.
     /// * `proposed_events` - Events to append.
     ///
     /// # Returns
@@ -442,6 +444,7 @@ impl Store {
         &mut self,
         stream_id: Uuid,
         expected_version: ExpectedVersion,
+        recorded_at: u64,
         proposed_events: Vec<ProposedEvent>,
     ) -> Result<Vec<RecordedEvent>, Error> {
         // Step 1: Acquire a read lock to validate expected version and compute
@@ -514,6 +517,7 @@ impl Store {
                 stream_id,
                 stream_version: next_stream_version,
                 global_position: next_global,
+                recorded_at,
                 event_type: proposed.event_type.clone(),
                 metadata: proposed.metadata.clone(),
                 payload: proposed.payload.clone(),
@@ -622,6 +626,7 @@ mod tests {
             stream_id,
             stream_version,
             global_position,
+            recorded_at: 0,
             event_type: event_type.to_string(),
             metadata: Bytes::new(),
             payload: Bytes::copy_from_slice(payload),
@@ -892,7 +897,7 @@ mod tests {
         let proposed = vec![make_proposed("OrderPlaced", b"{\"qty\":1}")];
 
         let recorded = store
-            .append(stream_id, ExpectedVersion::NoStream, proposed)
+            .append(stream_id, ExpectedVersion::NoStream, 0, proposed)
             .expect("append should succeed");
 
         assert_eq!(recorded.len(), 1);
@@ -919,7 +924,7 @@ mod tests {
         ];
 
         let recorded = store
-            .append(stream_id, ExpectedVersion::NoStream, proposed)
+            .append(stream_id, ExpectedVersion::NoStream, 0, proposed)
             .expect("append should succeed");
 
         assert_eq!(recorded.len(), 3);
@@ -949,7 +954,7 @@ mod tests {
         let proposed = vec![make_proposed("Created", b"{}")];
 
         let recorded = store
-            .append(stream_id, ExpectedVersion::Any, proposed)
+            .append(stream_id, ExpectedVersion::Any, 0, proposed)
             .expect("append with Any on new stream should succeed");
 
         assert_eq!(recorded.len(), 1);
@@ -973,7 +978,7 @@ mod tests {
             make_proposed("Evt3", b"p3"),
         ];
         store
-            .append(stream_id, ExpectedVersion::Any, first_batch)
+            .append(stream_id, ExpectedVersion::Any, 0, first_batch)
             .expect("first append should succeed");
 
         assert_eq!(store.stream_version(&stream_id), Some(2));
@@ -981,7 +986,7 @@ mod tests {
         // Second append with Any: should get stream_version = 3.
         let second_batch = vec![make_proposed("Evt4", b"p4")];
         let recorded = store
-            .append(stream_id, ExpectedVersion::Any, second_batch)
+            .append(stream_id, ExpectedVersion::Any, 0, second_batch)
             .expect("second append with Any should succeed");
 
         assert_eq!(recorded.len(), 1);
@@ -1000,7 +1005,7 @@ mod tests {
         let proposed = vec![make_proposed("Created", b"{}")];
 
         let recorded = store
-            .append(stream_id, ExpectedVersion::NoStream, proposed)
+            .append(stream_id, ExpectedVersion::NoStream, 0, proposed)
             .expect("append with NoStream on new stream should succeed");
 
         assert_eq!(recorded.len(), 1);
@@ -1019,12 +1024,12 @@ mod tests {
         // Create the stream first.
         let first = vec![make_proposed("Created", b"{}")];
         store
-            .append(stream_id, ExpectedVersion::NoStream, first)
+            .append(stream_id, ExpectedVersion::NoStream, 0, first)
             .expect("first append should succeed");
 
         // Now try NoStream again -- should fail.
         let second = vec![make_proposed("Updated", b"{}")];
-        match store.append(stream_id, ExpectedVersion::NoStream, second) {
+        match store.append(stream_id, ExpectedVersion::NoStream, 0, second) {
             Err(Error::WrongExpectedVersion { .. }) => {} // expected
             Err(other) => panic!("expected WrongExpectedVersion, got: {other:?}"),
             Ok(_) => panic!("expected WrongExpectedVersion error, but append succeeded"),
@@ -1043,13 +1048,13 @@ mod tests {
         // Append one event -> stream at version 0.
         let first = vec![make_proposed("Created", b"{}")];
         store
-            .append(stream_id, ExpectedVersion::NoStream, first)
+            .append(stream_id, ExpectedVersion::NoStream, 0, first)
             .expect("first append should succeed");
 
         // Append with Exact(0) -> should succeed, new event at version 1.
         let second = vec![make_proposed("Updated", b"{}")];
         let recorded = store
-            .append(stream_id, ExpectedVersion::Exact(0), second)
+            .append(stream_id, ExpectedVersion::Exact(0), 0, second)
             .expect("append with Exact(0) should succeed");
 
         assert_eq!(recorded.len(), 1);
@@ -1073,14 +1078,14 @@ mod tests {
             make_proposed("Evt4", b"p4"),
         ];
         store
-            .append(stream_id, ExpectedVersion::NoStream, events)
+            .append(stream_id, ExpectedVersion::NoStream, 0, events)
             .expect("first append should succeed");
 
         assert_eq!(store.stream_version(&stream_id), Some(3));
 
         // Try Exact(5) -- should fail.
         let next = vec![make_proposed("Evt5", b"p5")];
-        match store.append(stream_id, ExpectedVersion::Exact(5), next) {
+        match store.append(stream_id, ExpectedVersion::Exact(5), 0, next) {
             Err(Error::WrongExpectedVersion { .. }) => {} // expected
             Err(other) => panic!("expected WrongExpectedVersion, got: {other:?}"),
             Ok(_) => panic!("expected WrongExpectedVersion error, but append succeeded"),
@@ -1097,7 +1102,7 @@ mod tests {
         let stream_id = Uuid::new_v4();
 
         let proposed = vec![make_proposed("Created", b"{}")];
-        match store.append(stream_id, ExpectedVersion::Exact(0), proposed) {
+        match store.append(stream_id, ExpectedVersion::Exact(0), 0, proposed) {
             Err(Error::WrongExpectedVersion { .. }) => {} // expected
             Err(other) => panic!("expected WrongExpectedVersion, got: {other:?}"),
             Ok(_) => panic!("expected WrongExpectedVersion error, but append succeeded"),
@@ -1124,7 +1129,7 @@ mod tests {
             payload: Bytes::from(oversized_payload),
         }];
 
-        match store.append(stream_id, ExpectedVersion::Any, proposed) {
+        match store.append(stream_id, ExpectedVersion::Any, 0, proposed) {
             Err(Error::EventTooLarge { .. }) => {} // expected
             Err(other) => panic!("expected EventTooLarge, got: {other:?}"),
             Ok(_) => panic!("expected EventTooLarge error, but append succeeded"),
@@ -1150,7 +1155,7 @@ mod tests {
         let long_type = "A".repeat(MAX_EVENT_TYPE_LEN + 1);
         let proposed = vec![make_proposed(&long_type, b"{}")];
 
-        match store.append(stream_id, ExpectedVersion::Any, proposed) {
+        match store.append(stream_id, ExpectedVersion::Any, 0, proposed) {
             Err(Error::InvalidArgument(msg)) => {
                 assert!(
                     msg.contains("event type"),
@@ -1173,7 +1178,7 @@ mod tests {
 
         let proposed = vec![make_proposed("", b"{}")];
 
-        match store.append(stream_id, ExpectedVersion::Any, proposed) {
+        match store.append(stream_id, ExpectedVersion::Any, 0, proposed) {
             Err(Error::InvalidArgument(msg)) => {
                 assert!(
                     msg.contains("event type"),
@@ -1222,6 +1227,7 @@ mod tests {
             .append(
                 stream_a,
                 ExpectedVersion::NoStream,
+                0,
                 vec![make_proposed("A0", b"a0")],
             )
             .expect("append A0");
@@ -1229,6 +1235,7 @@ mod tests {
             .append(
                 stream_b,
                 ExpectedVersion::NoStream,
+                0,
                 vec![make_proposed("B0", b"b0")],
             )
             .expect("append B0");
@@ -1236,6 +1243,7 @@ mod tests {
             .append(
                 stream_a,
                 ExpectedVersion::Exact(0),
+                0,
                 vec![make_proposed("A1", b"a1")],
             )
             .expect("append A1");
@@ -1243,6 +1251,7 @@ mod tests {
             .append(
                 stream_c,
                 ExpectedVersion::NoStream,
+                0,
                 vec![make_proposed("C0", b"c0")],
             )
             .expect("append C0");
@@ -1250,6 +1259,7 @@ mod tests {
             .append(
                 stream_b,
                 ExpectedVersion::Exact(0),
+                0,
                 vec![make_proposed("B1", b"b1")],
             )
             .expect("append B1");
@@ -1400,7 +1410,7 @@ mod tests {
             .map(|i| make_proposed(&format!("Evt{i}"), format!("p{i}").as_bytes()))
             .collect();
         store
-            .append(stream_id, ExpectedVersion::NoStream, proposed)
+            .append(stream_id, ExpectedVersion::NoStream, 0, proposed)
             .expect("append should succeed");
         (stream_id, store)
     }
@@ -1491,22 +1501,22 @@ mod tests {
 
             let batch_a1 = vec![make_proposed("A0", b"a0"), make_proposed("A1", b"a1")];
             let rec_a1 = store
-                .append(stream_a, ExpectedVersion::NoStream, batch_a1)
+                .append(stream_a, ExpectedVersion::NoStream, 0, batch_a1)
                 .expect("append A batch 1");
 
             let batch_b1 = vec![make_proposed("B0", b"b0")];
             let rec_b1 = store
-                .append(stream_b, ExpectedVersion::NoStream, batch_b1)
+                .append(stream_b, ExpectedVersion::NoStream, 0, batch_b1)
                 .expect("append B batch 1");
 
             let batch_a2 = vec![make_proposed("A2", b"a2")];
             let rec_a2 = store
-                .append(stream_a, ExpectedVersion::Exact(1), batch_a2)
+                .append(stream_a, ExpectedVersion::Exact(1), 0, batch_a2)
                 .expect("append A batch 2");
 
             let batch_b2 = vec![make_proposed("B1", b"b1")];
             let rec_b2 = store
-                .append(stream_b, ExpectedVersion::Exact(0), batch_b2)
+                .append(stream_b, ExpectedVersion::Exact(0), 0, batch_b2)
                 .expect("append B batch 2");
 
             assert_eq!(store.global_position(), 5);
@@ -1558,7 +1568,7 @@ mod tests {
         // Phase 3: Subsequent append continues from correct positions.
         let next = vec![make_proposed("A3", b"a3")];
         let recorded = store
-            .append(stream_a, ExpectedVersion::Exact(2), next)
+            .append(stream_a, ExpectedVersion::Exact(2), 0, next)
             .expect("post-recovery append should succeed");
 
         assert_eq!(recorded.len(), 1);
@@ -1585,7 +1595,7 @@ mod tests {
                 make_proposed("Evt2", b"p2"),
             ];
             store
-                .append(stream_id, ExpectedVersion::NoStream, proposed)
+                .append(stream_id, ExpectedVersion::NoStream, 0, proposed)
                 .expect("append should succeed");
             assert_eq!(store.global_position(), 3);
             // `store` dropped here -- file handle closed.
@@ -1634,7 +1644,7 @@ mod tests {
         // Phase 4: Subsequent append succeeds at global_position = 3.
         let next = vec![make_proposed("Evt3", b"p3")];
         let recorded = store
-            .append(stream_id, ExpectedVersion::Exact(2), next)
+            .append(stream_id, ExpectedVersion::Exact(2), 0, next)
             .expect("post-recovery append should succeed");
 
         assert_eq!(recorded.len(), 1);
@@ -1667,7 +1677,7 @@ mod tests {
         let stream_id = Uuid::new_v4();
         let proposed = vec![make_proposed("Created", b"{}")];
         store
-            .append(stream_id, ExpectedVersion::NoStream, proposed)
+            .append(stream_id, ExpectedVersion::NoStream, 0, proposed)
             .expect("append should succeed");
 
         let log = store.log();
@@ -1722,7 +1732,7 @@ mod tests {
         ];
 
         store
-            .append(stream_id, ExpectedVersion::NoStream, proposed)
+            .append(stream_id, ExpectedVersion::NoStream, 0, proposed)
             .expect("append should succeed");
 
         // Read raw file bytes (do NOT drop and reopen the store).
@@ -1796,13 +1806,13 @@ mod tests {
         // First batch: 2 events.
         let batch1 = vec![make_proposed("Evt0", b"p0"), make_proposed("Evt1", b"p1")];
         store
-            .append(stream_id, ExpectedVersion::NoStream, batch1)
+            .append(stream_id, ExpectedVersion::NoStream, 0, batch1)
             .expect("first append should succeed");
 
         // Second batch: 1 event.
         let batch2 = vec![make_proposed("Evt2", b"p2")];
         store
-            .append(stream_id, ExpectedVersion::Exact(1), batch2)
+            .append(stream_id, ExpectedVersion::Exact(1), 0, batch2)
             .expect("second append should succeed");
 
         let data = std::fs::read(&path).expect("read file");
@@ -1893,7 +1903,7 @@ mod tests {
             make_proposed("OrderConfirmed", b"{\"status\":\"ok\"}"),
         ];
         let recorded1 = store
-            .append(stream_id, ExpectedVersion::NoStream, batch1)
+            .append(stream_id, ExpectedVersion::NoStream, 0, batch1)
             .expect("first append should succeed");
 
         assert_eq!(recorded1.len(), 2);
@@ -1909,7 +1919,7 @@ mod tests {
         // Second batch: 1 event to the same stream.
         let batch2 = vec![make_proposed("OrderShipped", b"{\"carrier\":\"ups\"}")];
         let recorded2 = store
-            .append(stream_id, ExpectedVersion::Exact(1), batch2)
+            .append(stream_id, ExpectedVersion::Exact(1), 0, batch2)
             .expect("second append should succeed");
 
         assert_eq!(recorded2.len(), 1);
@@ -2211,7 +2221,7 @@ mod tests {
         ];
 
         store
-            .append(stream_id, ExpectedVersion::NoStream, proposed)
+            .append(stream_id, ExpectedVersion::NoStream, 0, proposed)
             .expect("append should succeed");
 
         let events = store.read_all(0, 100);
@@ -2227,6 +2237,102 @@ mod tests {
             );
             assert_eq!(event.stream_id, stream_id);
         }
+    }
+
+    // --- PRD 017 Ticket 3: recorded_at parameter tests ---
+
+    // AC: call store.append with recorded_at = 1_700_000_000_000, assert returned
+    // events have recorded_at == 1_700_000_000_000.
+    #[test]
+    fn append_recorded_at_is_set_from_parameter() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        let mut store = Store::open(&path).expect("open should succeed");
+        let stream_id = Uuid::new_v4();
+        let proposed = vec![make_proposed("Evt", b"payload")];
+
+        let recorded = store
+            .append(stream_id, ExpectedVersion::Any, 1_700_000_000_000, proposed)
+            .expect("append should succeed");
+
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].recorded_at, 1_700_000_000_000,
+            "recorded_at should match the parameter"
+        );
+    }
+
+    // AC: two appends with different recorded_at values, assert each batch has its
+    // own timestamp.
+    #[test]
+    fn append_different_recorded_at_per_batch() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        let mut store = Store::open(&path).expect("open should succeed");
+        let stream_id = Uuid::new_v4();
+
+        let batch1 = vec![make_proposed("Evt0", b"p0"), make_proposed("Evt1", b"p1")];
+        let recorded1 = store
+            .append(
+                stream_id,
+                ExpectedVersion::NoStream,
+                1_000_000_000_000,
+                batch1,
+            )
+            .expect("first append should succeed");
+
+        let batch2 = vec![make_proposed("Evt2", b"p2")];
+        let recorded2 = store
+            .append(
+                stream_id,
+                ExpectedVersion::Exact(1),
+                2_000_000_000_000,
+                batch2,
+            )
+            .expect("second append should succeed");
+
+        // First batch: both events should have the first timestamp.
+        for event in &recorded1 {
+            assert_eq!(
+                event.recorded_at, 1_000_000_000_000,
+                "first batch recorded_at mismatch"
+            );
+        }
+        // Second batch: event should have the second timestamp.
+        assert_eq!(
+            recorded2[0].recorded_at, 2_000_000_000_000,
+            "second batch recorded_at mismatch"
+        );
+    }
+
+    // AC: append with recorded_at: 0, close and re-open store, assert recovered events
+    // have recorded_at == 0.
+    #[test]
+    fn append_recorded_at_zero_survives_reopen() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+
+        let stream_id = Uuid::new_v4();
+
+        // Phase 1: append with recorded_at: 0.
+        {
+            let mut store = Store::open(&path).expect("open should succeed");
+            let proposed = vec![make_proposed("Evt", b"payload")];
+            store
+                .append(stream_id, ExpectedVersion::NoStream, 0, proposed)
+                .expect("append should succeed");
+        }
+
+        // Phase 2: reopen and verify.
+        let store = Store::open(&path).expect("reopen should succeed");
+        let all = store.read_all(0, 100);
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].recorded_at, 0,
+            "recovered event recorded_at should be 0"
+        );
     }
 
     // --- log_file_len tests (PRD 013, Ticket 2) ---
@@ -2259,7 +2365,7 @@ mod tests {
             payload: Bytes::from_static(b"{}"),
         };
         store
-            .append(Uuid::new_v4(), ExpectedVersion::Any, vec![proposed])
+            .append(Uuid::new_v4(), ExpectedVersion::Any, 0, vec![proposed])
             .expect("append should succeed");
 
         let after = store.log_file_len().expect("log_file_len after append");

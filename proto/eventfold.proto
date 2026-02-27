@@ -24,6 +24,7 @@ message RecordedEvent {
     string event_type = 5;
     bytes metadata = 6;
     bytes payload = 7;
+    uint64 recorded_at = 8;  // Unix epoch milliseconds, server-assigned
 }
 
 message ExpectedVersion {

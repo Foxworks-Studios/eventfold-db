@@ -125,6 +125,7 @@ mod tests {
             stream_id,
             stream_version: version,
             global_position: position,
+            recorded_at: 0,
             event_type: "TestEvent".to_string(),
             metadata: Bytes::new(),
             payload: Bytes::from_static(b"{}"),

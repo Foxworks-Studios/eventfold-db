@@ -51,6 +51,7 @@ mod tests {
             stream_id: uuid::Uuid::new_v4(),
             stream_version: 0,
             global_position: 0,
+            recorded_at: 0,
             event_type: "TestEvent".to_string(),
             metadata: bytes::Bytes::new(),
             payload: bytes::Bytes::new(),

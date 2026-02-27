@@ -395,6 +395,7 @@ pub fn recorded_to_proto(e: &RecordedEvent) -> proto::RecordedEvent {
         event_type: e.event_type.clone(),
         metadata: e.metadata.to_vec(),
         payload: e.payload.to_vec(),
+        recorded_at: e.recorded_at,
     }
 }
 
@@ -605,6 +606,7 @@ mod tests {
             stream_id,
             stream_version: 5,
             global_position: 42,
+            recorded_at: 0,
             event_type: "PaymentReceived".to_string(),
             metadata: Bytes::from_static(b"meta"),
             payload: Bytes::from_static(b"payload"),
@@ -619,6 +621,29 @@ mod tests {
         assert_eq!(proto_event.event_type, "PaymentReceived");
         assert_eq!(proto_event.metadata, b"meta");
         assert_eq!(proto_event.payload, b"payload");
+    }
+
+    #[test]
+    fn recorded_to_proto_maps_recorded_at() {
+        let event_id = Uuid::new_v4();
+        let stream_id = Uuid::new_v4();
+        let domain = RecordedEvent {
+            event_id,
+            stream_id,
+            stream_version: 0,
+            global_position: 0,
+            recorded_at: 1_700_000_000_000,
+            event_type: "TimestampTest".to_string(),
+            metadata: Bytes::from_static(b"meta"),
+            payload: Bytes::from_static(b"payload"),
+        };
+
+        let proto_event = recorded_to_proto(&domain);
+
+        assert_eq!(
+            proto_event.recorded_at, 1_700_000_000_000,
+            "recorded_at should be mapped from domain to proto"
+        );
     }
 
     // -- metrics tests --

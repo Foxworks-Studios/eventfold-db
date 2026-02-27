@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use metrics::{counter, gauge, histogram};
 use uuid::Uuid;
@@ -184,6 +184,13 @@ pub(crate) async fn run_writer(
             batch.push(req);
         }
 
+        // Stamp once per batch iteration so all requests drained together
+        // share the same millisecond timestamp.
+        let recorded_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_millis() as u64;
+
         // Process each request sequentially. Each call to store.append()
         // writes to disk, fsyncs, and updates the in-memory index.
         for req in batch {
@@ -214,7 +221,7 @@ pub(crate) async fn run_writer(
 
             // Step 2: Not a dedup hit -- perform the actual append.
             let start = Instant::now();
-            let result = store.append(req.stream_id, req.expected_version, req.events);
+            let result = store.append(req.stream_id, req.expected_version, recorded_at, req.events);
 
             // On success: update metrics, record in dedup index, then publish
             // to broker. Failed appends do not update any metric.
@@ -1182,6 +1189,73 @@ mod tests {
         assert!(
             ok_result.is_ok(),
             "valid append after duplicate rejection should succeed"
+        );
+
+        drop(handle);
+        join_handle.await.expect("writer task should exit cleanly");
+    }
+
+    // --- Timestamp tests (PRD 017, Ticket 4) ---
+
+    #[tokio::test]
+    async fn recorded_at_is_nonzero_for_single_event() {
+        let (store, _dir) = temp_store();
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), test_dedup_cap());
+
+        let stream_id = uuid::Uuid::new_v4();
+        let result = handle
+            .append(
+                stream_id,
+                crate::types::ExpectedVersion::NoStream,
+                vec![proposed("TimestampEvt")],
+            )
+            .await
+            .expect("append should succeed");
+
+        assert_eq!(result.len(), 1);
+        assert!(
+            result[0].recorded_at > 0,
+            "recorded_at should be nonzero, got {}",
+            result[0].recorded_at
+        );
+
+        drop(handle);
+        join_handle.await.expect("writer task should exit cleanly");
+    }
+
+    #[tokio::test]
+    async fn batch_of_three_events_share_same_recorded_at() {
+        let (store, _dir) = temp_store();
+        let (handle, _read_index, join_handle) =
+            super::spawn_writer(store, 8, crate::broker::Broker::new(64), test_dedup_cap());
+
+        let stream_id = uuid::Uuid::new_v4();
+        let events = vec![
+            proposed("BatchEvt1"),
+            proposed("BatchEvt2"),
+            proposed("BatchEvt3"),
+        ];
+
+        let result = handle
+            .append(stream_id, crate::types::ExpectedVersion::NoStream, events)
+            .await
+            .expect("append should succeed");
+
+        assert_eq!(result.len(), 3);
+
+        // All three events should have the same recorded_at, and it should be nonzero.
+        let ts = result[0].recorded_at;
+        assert!(ts > 0, "recorded_at should be nonzero, got {ts}");
+        assert_eq!(
+            result[1].recorded_at, ts,
+            "event 1 recorded_at ({}) should match event 0 ({ts})",
+            result[1].recorded_at
+        );
+        assert_eq!(
+            result[2].recorded_at, ts,
+            "event 2 recorded_at ({}) should match event 0 ({ts})",
+            result[2].recorded_at
         );
 
         drop(handle);

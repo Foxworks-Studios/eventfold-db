@@ -1169,6 +1169,117 @@ async fn all_five_rpcs_smoke_test() {
     );
 }
 
+// -- Test: ReadAll returns recorded_at > 0 --
+
+#[tokio::test]
+async fn read_all_returns_nonzero_recorded_at() {
+    let (mut client, _addr, _dir) = start_test_server().await;
+
+    let stream_id = uuid::Uuid::new_v4().to_string();
+    client
+        .append(proto::AppendRequest {
+            stream_id,
+            expected_version: no_stream(),
+            events: vec![make_proposed("Evt0")],
+        })
+        .await
+        .expect("append should succeed");
+
+    let resp = client
+        .read_all(proto::ReadAllRequest {
+            from_position: 0,
+            max_count: 100,
+        })
+        .await
+        .expect("read_all should succeed");
+
+    let events = resp.into_inner().events;
+    assert_eq!(events.len(), 1);
+    assert!(
+        events[0].recorded_at > 0,
+        "recorded_at should be > 0, got: {}",
+        events[0].recorded_at
+    );
+}
+
+// -- Test: ReadStream returns recorded_at > 0 --
+
+#[tokio::test]
+async fn read_stream_returns_nonzero_recorded_at() {
+    let (mut client, _addr, _dir) = start_test_server().await;
+
+    let stream_id = uuid::Uuid::new_v4().to_string();
+    client
+        .append(proto::AppendRequest {
+            stream_id: stream_id.clone(),
+            expected_version: no_stream(),
+            events: vec![make_proposed("Evt0")],
+        })
+        .await
+        .expect("append should succeed");
+
+    let resp = client
+        .read_stream(proto::ReadStreamRequest {
+            stream_id,
+            from_version: 0,
+            max_count: 100,
+        })
+        .await
+        .expect("read_stream should succeed");
+
+    let events = resp.into_inner().events;
+    assert_eq!(events.len(), 1);
+    assert!(
+        events[0].recorded_at > 0,
+        "recorded_at should be > 0, got: {}",
+        events[0].recorded_at
+    );
+}
+
+// -- Test: SubscribeAll yields event with recorded_at > 0 --
+
+#[tokio::test]
+async fn subscribe_all_yields_nonzero_recorded_at() {
+    let (mut client, _addr, _dir) = start_test_server().await;
+
+    let stream_id = uuid::Uuid::new_v4().to_string();
+    client
+        .append(proto::AppendRequest {
+            stream_id,
+            expected_version: no_stream(),
+            events: vec![make_proposed("Evt0")],
+        })
+        .await
+        .expect("append should succeed");
+
+    let mut sub = client
+        .subscribe_all(proto::SubscribeAllRequest { from_position: 0 })
+        .await
+        .expect("subscribe_all should succeed")
+        .into_inner();
+
+    let timeout_dur = std::time::Duration::from_secs(5);
+
+    let msg = tokio::time::timeout(timeout_dur, sub.message())
+        .await
+        .expect("should not timeout")
+        .expect("message should succeed")
+        .expect("stream should not end");
+
+    match msg.content.expect("content should be set") {
+        proto::subscribe_response::Content::Event(e) => {
+            assert!(
+                e.recorded_at > 0,
+                "recorded_at should be > 0, got: {}",
+                e.recorded_at
+            );
+        }
+        proto::subscribe_response::Content::CaughtUp(_) => {
+            panic!("expected Event, got CaughtUp");
+        }
+    }
+}
+
 // -- Error codes test: verify INVALID_ARGUMENT, NOT_FOUND, FAILED_PRECONDITION in one test --
 
 #[tokio::test]
