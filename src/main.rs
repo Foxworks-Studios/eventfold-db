@@ -244,8 +244,9 @@ async fn main() {
     let (writer_handle, read_index, join_handle) =
         spawn_writer(store, 64, broker.clone(), config.dedup_capacity);
 
-    // 7. Build the EventfoldService.
+    // 7. Build the EventfoldService and health reporter.
     let service = EventfoldService::new(writer_handle.clone(), read_index, broker);
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
 
     // 8. Build the tonic Server, optionally with TLS.
     let mut builder = tonic::transport::Server::builder();
@@ -294,7 +295,9 @@ async fn main() {
         });
     }
 
-    let server = builder.add_service(EventStoreServer::new(service));
+    let server = builder
+        .add_service(health_service)
+        .add_service(EventStoreServer::new(service));
 
     // 9. Bind on the configured address.
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
@@ -317,9 +320,27 @@ async fn main() {
     // 10. Log the actual bound address.
     tracing::info!("Server listening on {addr}");
 
-    // 11-12. Serve until shutdown signal, then clean up.
+    // 11. Mark health service as SERVING now that the listener is bound.
+    health_reporter
+        .set_serving::<EventStoreServer<EventfoldService>>()
+        .await;
+    health_reporter
+        .set_service_status("", tonic_health::ServingStatus::Serving)
+        .await;
+
+    // 12-13. Serve until shutdown signal, then clean up.
+    // The shutdown future transitions health status to NOT_SERVING before the
+    // server begins draining connections.
     server
-        .serve_with_incoming_shutdown(incoming, shutdown_signal())
+        .serve_with_incoming_shutdown(incoming, async {
+            shutdown_signal().await;
+            health_reporter
+                .set_service_status("", tonic_health::ServingStatus::NotServing)
+                .await;
+            health_reporter
+                .set_not_serving::<EventStoreServer<EventfoldService>>()
+                .await;
+        })
         .await
         .unwrap_or_else(|e| {
             tracing::error!(error = %e, "Server error");
@@ -606,6 +627,31 @@ mod tests {
             !output.status.success(),
             "expected non-zero exit when TLS cert file does not exist"
         );
+    }
+
+    #[tokio::test]
+    async fn health_reporter_can_set_serving_and_not_serving() {
+        // Verify that tonic-health dependency is available and the API works
+        // for both the empty-string service name and the typed service name.
+        use eventfold_db::proto::event_store_server::EventStoreServer;
+
+        let (reporter, _service) = tonic_health::server::health_reporter();
+
+        // Set serving for both service names (same pattern as main.rs wiring).
+        reporter
+            .set_serving::<EventStoreServer<EventfoldService>>()
+            .await;
+        reporter
+            .set_service_status("", tonic_health::ServingStatus::Serving)
+            .await;
+
+        // Transition to NOT_SERVING (same pattern as shutdown path).
+        reporter
+            .set_service_status("", tonic_health::ServingStatus::NotServing)
+            .await;
+        reporter
+            .set_not_serving::<EventStoreServer<EventfoldService>>()
+            .await;
     }
 
     #[test]

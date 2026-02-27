@@ -1,6 +1,6 @@
 # PRD 012: gRPC Health Check / Readiness Probe
 
-**Status:** DRAFT
+**Status:** TICKETS READY
 **Created:** 2026-02-26
 **Author:** PRD Writer Agent
 

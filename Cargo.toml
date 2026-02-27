@@ -17,6 +17,7 @@ prost = "0.13"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.13", features = ["tls-ring"] }
+tonic-health = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-stream = "0.1"
