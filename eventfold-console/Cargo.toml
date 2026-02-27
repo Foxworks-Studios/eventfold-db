@@ -1,0 +1,20 @@
+[package]
+name = "eventfold-console"
+version = "0.1.0"
+edition = "2024"
+description = "Interactive TUI console for browsing EventfoldDB"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+eventfold-db = { path = ".." }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+ratatui = "0.29"
+tokio = { version = "1", features = ["full"] }
+tonic = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
+thiserror = "2"
+unicode-width = "0.2"
