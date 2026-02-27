@@ -233,7 +233,19 @@ impl AppState {
     pub fn apply_action(&mut self, action: Action) {
         match action {
             Action::Quit => self.should_quit = true,
-            Action::SwitchTab(tab) => self.active_tab = tab,
+            Action::SwitchTab(tab) => {
+                self.active_tab = tab;
+                // Auto-load data when switching to a tab that has no data yet.
+                match tab {
+                    Tab::Streams if self.streams.is_empty() && !self.streams_loading => {
+                        self.streams_loading = true;
+                    }
+                    Tab::GlobalLog if self.global_events.is_empty() && !self.global_loading => {
+                        self.global_loading = true;
+                    }
+                    _ => {}
+                }
+            }
             Action::CursorUp => {
                 let cursor = self.current_cursor_mut();
                 *cursor = cursor.saturating_sub(1);
@@ -488,6 +500,41 @@ mod tests {
         state.active_tab = Tab::GlobalLog;
         state.apply_action(Action::Refresh);
         assert!(state.global_loading);
+    }
+
+    // -- SwitchTab auto-load --
+
+    #[test]
+    fn switch_to_global_log_auto_loads_when_empty() {
+        let mut state = AppState::new("test".into());
+        assert!(state.global_events.is_empty());
+        state.apply_action(Action::SwitchTab(Tab::GlobalLog));
+        assert_eq!(state.active_tab, Tab::GlobalLog);
+        assert!(state.global_loading);
+    }
+
+    #[test]
+    fn switch_to_global_log_skips_load_when_populated() {
+        let mut state = AppState::new("test".into());
+        state.global_events.push(EventRecord {
+            event_id: "eid".into(),
+            stream_id: "sid".into(),
+            stream_version: 0,
+            global_position: 0,
+            event_type: "Test".into(),
+            metadata: vec![],
+            payload: vec![],
+        });
+        state.apply_action(Action::SwitchTab(Tab::GlobalLog));
+        assert!(!state.global_loading);
+    }
+
+    #[test]
+    fn switch_to_streams_auto_loads_when_empty() {
+        let mut state = AppState::new("test".into());
+        state.active_tab = Tab::GlobalLog; // start elsewhere
+        state.apply_action(Action::SwitchTab(Tab::Streams));
+        assert!(state.streams_loading);
     }
 
     // -- Action::ToggleFormat --
