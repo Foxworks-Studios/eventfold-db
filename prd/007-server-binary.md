@@ -1,5 +1,7 @@
 # PRD 007: Server Binary and Configuration
 
+**Status:** TICKETS READY
+
 ## Summary
 
 Wire everything together into the final `main.rs` binary: read configuration from environment variables, open the storage engine, spawn the writer task and broker, start the gRPC server, and handle graceful shutdown. This is the thin orchestration layer that composes all previous modules into a running server.
