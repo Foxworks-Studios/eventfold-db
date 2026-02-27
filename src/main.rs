@@ -5,16 +5,34 @@ use std::path::PathBuf;
 use eventfold_db::proto::event_store_server::EventStoreServer;
 use eventfold_db::{Broker, EventfoldService, Store, spawn_writer};
 
+/// Optional TLS configuration parsed from environment variables.
+///
+/// Present only when `EVENTFOLD_TLS_CERT` and `EVENTFOLD_TLS_KEY` are both set.
+/// When `EVENTFOLD_TLS_CA` is also set, the server requires client certificates (mTLS).
+#[derive(Debug, Clone, PartialEq)]
+struct TlsConfig {
+    /// Path to the PEM-encoded server certificate file.
+    cert_path: PathBuf,
+    /// Path to the PEM-encoded server private key file.
+    key_path: PathBuf,
+    /// Path to the PEM-encoded CA certificate for client verification (mTLS).
+    /// When `Some`, the server requires and verifies client certificates.
+    ca_path: Option<PathBuf>,
+}
+
 /// Server configuration parsed from environment variables.
 ///
 /// # Environment Variables
 ///
-/// | Variable                    | Required | Default      | Description                        |
-/// |-----------------------------|----------|--------------|------------------------------------|
-/// | `EVENTFOLD_DATA`            | Yes      | --           | Path to the append-only log file   |
-/// | `EVENTFOLD_LISTEN`          | No       | `[::]:2113`  | Socket address to listen on        |
-/// | `EVENTFOLD_BROKER_CAPACITY` | No       | `4096`       | Broadcast channel buffer size      |
-/// | `EVENTFOLD_DEDUP_CAPACITY`  | No       | `65536`      | Max event IDs in dedup index       |
+/// | Variable                    | Required | Default      | Description                          |
+/// |-----------------------------|----------|--------------|--------------------------------------|
+/// | `EVENTFOLD_DATA`            | Yes      | --           | Path to the append-only log file     |
+/// | `EVENTFOLD_LISTEN`          | No       | `[::]:2113`  | Socket address to listen on          |
+/// | `EVENTFOLD_BROKER_CAPACITY` | No       | `4096`       | Broadcast channel buffer size        |
+/// | `EVENTFOLD_DEDUP_CAPACITY`  | No       | `65536`      | Max event IDs in dedup index         |
+/// | `EVENTFOLD_TLS_CERT`        | No       | --           | PEM cert path (enables TLS)          |
+/// | `EVENTFOLD_TLS_KEY`         | No       | --           | PEM key path (required with CERT)    |
+/// | `EVENTFOLD_TLS_CA`          | No       | --           | PEM CA path (enables mTLS)           |
 #[derive(Debug, Clone, PartialEq)]
 struct Config {
     /// Path to the append-only event log file.
@@ -25,6 +43,8 @@ struct Config {
     broker_capacity: usize,
     /// Maximum number of event IDs tracked in the dedup index.
     dedup_capacity: NonZeroUsize,
+    /// Optional TLS configuration. `None` means plaintext mode.
+    tls: Option<TlsConfig>,
 }
 
 /// Default socket address the server listens on when `EVENTFOLD_LISTEN` is not set.
@@ -55,6 +75,8 @@ impl Config {
     /// - `EVENTFOLD_LISTEN` is set but not a valid `SocketAddr`
     /// - `EVENTFOLD_BROKER_CAPACITY` is set but not a valid `usize`
     /// - `EVENTFOLD_DEDUP_CAPACITY` is set but not a valid nonzero `usize`
+    /// - `EVENTFOLD_TLS_CERT` is set without `EVENTFOLD_TLS_KEY` (or vice versa)
+    /// - `EVENTFOLD_TLS_CA` is set without both `EVENTFOLD_TLS_CERT` and `EVENTFOLD_TLS_KEY`
     fn from_env() -> Result<Config, String> {
         let data_path = std::env::var("EVENTFOLD_DATA")
             .map(PathBuf::from)
@@ -88,11 +110,53 @@ impl Config {
                 .expect("default dedup capacity is nonzero"),
         };
 
+        // Parse optional TLS configuration from environment variables.
+        // Both CERT and KEY must be set together; CA is optional (enables mTLS).
+        let tls_cert = std::env::var("EVENTFOLD_TLS_CERT").ok();
+        let tls_key = std::env::var("EVENTFOLD_TLS_KEY").ok();
+        let tls_ca = std::env::var("EVENTFOLD_TLS_CA").ok();
+
+        let tls = match (tls_cert, tls_key, tls_ca) {
+            // All three absent: plaintext mode.
+            (None, None, None) => None,
+            // Both cert and key present, CA absent: TLS without mTLS.
+            (Some(cert), Some(key), None) => Some(TlsConfig {
+                cert_path: PathBuf::from(cert),
+                key_path: PathBuf::from(key),
+                ca_path: None,
+            }),
+            // All three present: TLS with mTLS.
+            (Some(cert), Some(key), Some(ca)) => Some(TlsConfig {
+                cert_path: PathBuf::from(cert),
+                key_path: PathBuf::from(key),
+                ca_path: Some(PathBuf::from(ca)),
+            }),
+            // Cert set, key missing.
+            (Some(_), None, _) => {
+                return Err(
+                    "EVENTFOLD_TLS_CERT is set but EVENTFOLD_TLS_KEY is missing".to_string()
+                );
+            }
+            // Key set, cert missing.
+            (None, Some(_), _) => {
+                return Err(
+                    "EVENTFOLD_TLS_KEY is set but EVENTFOLD_TLS_CERT is missing".to_string()
+                );
+            }
+            // CA set without cert and key.
+            (None, None, Some(_)) => {
+                return Err("EVENTFOLD_TLS_CA is set but EVENTFOLD_TLS_CERT and \
+                     EVENTFOLD_TLS_KEY are both missing"
+                    .to_string());
+            }
+        };
+
         Ok(Config {
             data_path,
             listen_addr,
             broker_capacity,
             dedup_capacity,
+            tls,
         })
     }
 }
@@ -183,8 +247,54 @@ async fn main() {
     // 7. Build the EventfoldService.
     let service = EventfoldService::new(writer_handle.clone(), read_index, broker);
 
-    // 8. Build the tonic Server.
-    let server = tonic::transport::Server::builder().add_service(EventStoreServer::new(service));
+    // 8. Build the tonic Server, optionally with TLS.
+    let mut builder = tonic::transport::Server::builder();
+
+    if let Some(ref tls) = config.tls {
+        let cert = tokio::fs::read(&tls.cert_path).await.unwrap_or_else(|e| {
+            tracing::error!(
+                path = %tls.cert_path.display(),
+                error = %e,
+                "Failed to read TLS certificate"
+            );
+            std::process::exit(1);
+        });
+
+        let key = tokio::fs::read(&tls.key_path).await.unwrap_or_else(|e| {
+            tracing::error!(
+                path = %tls.key_path.display(),
+                error = %e,
+                "Failed to read TLS private key"
+            );
+            std::process::exit(1);
+        });
+
+        let identity = tonic::transport::Identity::from_pem(cert, key);
+        let mut tls_config = tonic::transport::ServerTlsConfig::new().identity(identity);
+
+        if let Some(ref ca_path) = tls.ca_path {
+            let ca = tokio::fs::read(ca_path).await.unwrap_or_else(|e| {
+                tracing::error!(
+                    path = %ca_path.display(),
+                    error = %e,
+                    "Failed to read TLS CA certificate"
+                );
+                std::process::exit(1);
+            });
+            let ca_cert = tonic::transport::Certificate::from_pem(ca);
+            tls_config = tls_config.client_ca_root(ca_cert);
+            tracing::info!("mTLS enabled");
+        } else {
+            tracing::info!("TLS enabled");
+        }
+
+        builder = builder.tls_config(tls_config).unwrap_or_else(|e| {
+            tracing::error!(error = %e, "Failed to configure TLS");
+            std::process::exit(1);
+        });
+    }
+
+    let server = builder.add_service(EventStoreServer::new(service));
 
     // 9. Bind on the configured address.
     let listener = tokio::net::TcpListener::bind(config.listen_addr)
@@ -229,6 +339,14 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    /// Clear all TLS-related environment variables so they do not leak between tests.
+    fn clear_tls_env() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::remove_var("EVENTFOLD_TLS_CERT") };
+        unsafe { std::env::remove_var("EVENTFOLD_TLS_KEY") };
+        unsafe { std::env::remove_var("EVENTFOLD_TLS_CA") };
+    }
+
     #[test]
     #[serial]
     fn from_env_defaults_when_only_data_set() {
@@ -237,6 +355,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
         unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        clear_tls_env();
 
         let config = Config::from_env().expect("should succeed with EVENTFOLD_DATA set");
         assert_eq!(config.data_path, PathBuf::from("/tmp/x"));
@@ -256,6 +375,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
         unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        clear_tls_env();
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err when EVENTFOLD_DATA is unset");
@@ -274,6 +394,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_LISTEN", "127.0.0.1:9999") };
         unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        clear_tls_env();
 
         let config = Config::from_env().expect("should succeed");
         assert_eq!(
@@ -290,6 +411,7 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
         unsafe { std::env::set_var("EVENTFOLD_BROKER_CAPACITY", "16") };
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        clear_tls_env();
 
         let config = Config::from_env().expect("should succeed");
         assert_eq!(config.broker_capacity, 16);
@@ -303,6 +425,7 @@ mod tests {
         unsafe { std::env::set_var("EVENTFOLD_LISTEN", "not-an-addr") };
         unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        clear_tls_env();
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err for invalid listen address");
@@ -323,9 +446,166 @@ mod tests {
         unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
         unsafe { std::env::set_var("EVENTFOLD_BROKER_CAPACITY", "not-a-number") };
         unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        clear_tls_env();
 
         let result = Config::from_env();
         assert!(result.is_err(), "expected Err for invalid broker capacity");
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_tls_none_when_no_tls_vars() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
+        unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
+        unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        clear_tls_env();
+
+        let config = Config::from_env().expect("should succeed without TLS vars");
+        assert_eq!(config.tls, None);
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_tls_ca_only_returns_err() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
+        unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
+        unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_TLS_CERT") };
+        unsafe { std::env::remove_var("EVENTFOLD_TLS_KEY") };
+        unsafe { std::env::set_var("EVENTFOLD_TLS_CA", "/tmp/ca.crt") };
+
+        let result = Config::from_env();
+        assert!(
+            result.is_err(),
+            "expected Err when CA is set without cert+key"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("EVENTFOLD_TLS_CERT"),
+            "error should mention EVENTFOLD_TLS_CERT, got: {msg}"
+        );
+        assert!(
+            msg.contains("EVENTFOLD_TLS_KEY"),
+            "error should mention EVENTFOLD_TLS_KEY, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_tls_key_without_cert_returns_err() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
+        unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
+        unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_TLS_CERT") };
+        unsafe { std::env::set_var("EVENTFOLD_TLS_KEY", "/tmp/k.key") };
+        unsafe { std::env::remove_var("EVENTFOLD_TLS_CA") };
+
+        let result = Config::from_env();
+        assert!(result.is_err(), "expected Err when CERT is missing");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("EVENTFOLD_TLS_CERT"),
+            "error should mention EVENTFOLD_TLS_CERT, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_tls_cert_without_key_returns_err() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
+        unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
+        unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        unsafe { std::env::set_var("EVENTFOLD_TLS_CERT", "/tmp/c.crt") };
+        unsafe { std::env::remove_var("EVENTFOLD_TLS_KEY") };
+        unsafe { std::env::remove_var("EVENTFOLD_TLS_CA") };
+
+        let result = Config::from_env();
+        assert!(result.is_err(), "expected Err when KEY is missing");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("EVENTFOLD_TLS_KEY"),
+            "error should mention EVENTFOLD_TLS_KEY, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_tls_cert_key_and_ca() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
+        unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
+        unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        unsafe { std::env::set_var("EVENTFOLD_TLS_CERT", "/tmp/c.crt") };
+        unsafe { std::env::set_var("EVENTFOLD_TLS_KEY", "/tmp/k.key") };
+        unsafe { std::env::set_var("EVENTFOLD_TLS_CA", "/tmp/ca.crt") };
+
+        let config = Config::from_env().expect("should succeed with cert, key, and CA");
+        assert_eq!(
+            config.tls,
+            Some(TlsConfig {
+                cert_path: PathBuf::from("/tmp/c.crt"),
+                key_path: PathBuf::from("/tmp/k.key"),
+                ca_path: Some(PathBuf::from("/tmp/ca.crt")),
+            })
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn from_env_tls_cert_and_key_without_ca() {
+        // SAFETY: serial test -- no concurrent env mutation.
+        unsafe { std::env::set_var("EVENTFOLD_DATA", "/tmp/x") };
+        unsafe { std::env::remove_var("EVENTFOLD_LISTEN") };
+        unsafe { std::env::remove_var("EVENTFOLD_BROKER_CAPACITY") };
+        unsafe { std::env::remove_var("EVENTFOLD_DEDUP_CAPACITY") };
+        unsafe { std::env::set_var("EVENTFOLD_TLS_CERT", "/tmp/c.crt") };
+        unsafe { std::env::set_var("EVENTFOLD_TLS_KEY", "/tmp/k.key") };
+        unsafe { std::env::remove_var("EVENTFOLD_TLS_CA") };
+
+        let config = Config::from_env().expect("should succeed with cert and key");
+        assert_eq!(
+            config.tls,
+            Some(TlsConfig {
+                cert_path: PathBuf::from("/tmp/c.crt"),
+                key_path: PathBuf::from("/tmp/k.key"),
+                ca_path: None,
+            })
+        );
+    }
+
+    #[test]
+    fn binary_exits_nonzero_when_tls_cert_file_missing() {
+        // When EVENTFOLD_TLS_CERT and EVENTFOLD_TLS_KEY point to nonexistent files,
+        // the binary should log an error (via tracing::error!) and exit non-zero.
+        // We only assert on exit status because tracing output may not be fully
+        // flushed before process::exit(1) terminates the process.
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let data_path = dir.path().join("events.log");
+
+        let output = std::process::Command::new("cargo")
+            .args(["run", "--bin", "eventfold-db", "--quiet"])
+            .env("EVENTFOLD_DATA", data_path.as_os_str())
+            .env("EVENTFOLD_LISTEN", "[::1]:0")
+            .env("EVENTFOLD_TLS_CERT", "/tmp/nonexistent-cert.pem")
+            .env("EVENTFOLD_TLS_KEY", "/tmp/nonexistent-key.pem")
+            .env_remove("EVENTFOLD_TLS_CA")
+            .env_remove("EVENTFOLD_BROKER_CAPACITY")
+            .output()
+            .expect("failed to execute cargo run");
+
+        assert!(
+            !output.status.success(),
+            "expected non-zero exit when TLS cert file does not exist"
+        );
     }
 
     #[test]
@@ -338,6 +618,9 @@ mod tests {
             .env_remove("EVENTFOLD_DATA")
             .env_remove("EVENTFOLD_LISTEN")
             .env_remove("EVENTFOLD_BROKER_CAPACITY")
+            .env_remove("EVENTFOLD_TLS_CERT")
+            .env_remove("EVENTFOLD_TLS_KEY")
+            .env_remove("EVENTFOLD_TLS_CA")
             .output()
             .expect("failed to execute cargo run");
 

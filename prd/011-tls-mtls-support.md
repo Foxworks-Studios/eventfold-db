@@ -1,6 +1,6 @@
 # PRD 011: TLS and mTLS Support
 
-**Status:** DRAFT
+**Status:** TICKETS READY
 **Created:** 2026-02-26
 **Author:** PRD Writer Agent
 

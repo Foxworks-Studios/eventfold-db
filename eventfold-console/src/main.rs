@@ -12,6 +12,7 @@
 //!
 //! The `--addr` flag defaults to `http://[::1]:2113`.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -20,7 +21,7 @@ use crossterm::event::{self, Event, poll};
 use tokio::sync::mpsc;
 
 use eventfold_console::app::{self, AppState};
-use eventfold_console::client::{self, Client, SubscriptionMsg};
+use eventfold_console::client::{self, Client, SubscriptionMsg, TlsOptions};
 use eventfold_console::tui;
 
 /// Interactive TUI console for browsing an EventfoldDB server.
@@ -30,6 +31,22 @@ struct Cli {
     /// Server address to connect to.
     #[arg(long, default_value = "http://[::1]:2113")]
     addr: String,
+
+    /// Enable TLS for the connection.
+    #[arg(long, default_value_t = false)]
+    tls: bool,
+
+    /// Path to a PEM-encoded CA certificate for server verification.
+    #[arg(long)]
+    tls_ca: Option<PathBuf>,
+
+    /// Path to a PEM-encoded client certificate for mTLS.
+    #[arg(long)]
+    tls_client_cert: Option<PathBuf>,
+
+    /// Path to a PEM-encoded client private key for mTLS.
+    #[arg(long)]
+    tls_client_key: Option<PathBuf>,
 }
 
 /// Tick interval for the event loop (approximately 30 fps).
@@ -41,18 +58,92 @@ const LIST_STREAMS_PAGE_SIZE: u64 = 1000;
 /// Page size for reading events in the detail and global log views.
 const READ_PAGE_SIZE: u64 = 1000;
 
+/// Validate that `--tls-client-cert` and `--tls-client-key` are either both
+/// supplied or both absent. If only one is given, prints an error to stderr
+/// and exits with a non-zero status code.
+fn validate_tls_flags(cli: &Cli) {
+    let has_cert = cli.tls_client_cert.is_some();
+    let has_key = cli.tls_client_key.is_some();
+    if has_cert != has_key {
+        let missing = if has_cert {
+            "--tls-client-key"
+        } else {
+            "--tls-client-cert"
+        };
+        eprintln!(
+            "error: --tls-client-cert and --tls-client-key must be provided \
+             together; missing {missing}"
+        );
+        std::process::exit(1);
+    }
+}
+
+/// Build [`TlsOptions`] from the parsed CLI flags by reading PEM files from
+/// disk.
+///
+/// When no TLS flags are set, returns `TlsOptions::default()` (plaintext).
+///
+/// # Errors
+///
+/// Returns an error if any specified PEM file cannot be read from disk.
+async fn build_tls_options(cli: &Cli) -> Result<TlsOptions> {
+    // No TLS flags set -- plaintext mode.
+    if !cli.tls && cli.tls_ca.is_none() && cli.tls_client_cert.is_none() {
+        return Ok(TlsOptions::default());
+    }
+
+    let mut opts = TlsOptions {
+        enabled: true,
+        ..Default::default()
+    };
+
+    // Read CA certificate if provided.
+    if let Some(ref ca_path) = cli.tls_ca {
+        let ca_pem = tokio::fs::read(ca_path)
+            .await
+            .with_context(|| format!("failed to read CA certificate: {}", ca_path.display()))?;
+        opts.ca_pem = Some(ca_pem);
+    }
+
+    // Read client identity if provided (already validated as a pair).
+    if let Some(ref cert_path) = cli.tls_client_cert {
+        let cert_pem = tokio::fs::read(cert_path).await.with_context(|| {
+            format!("failed to read client certificate: {}", cert_path.display())
+        })?;
+        // Safe to unwrap: validate_tls_flags ensures key is present when cert is.
+        let key_path = cli
+            .tls_client_key
+            .as_ref()
+            .expect("invariant: tls_client_key must be Some when tls_client_cert is Some");
+        let key_pem = tokio::fs::read(key_path)
+            .await
+            .with_context(|| format!("failed to read client key: {}", key_path.display()))?;
+        opts.identity = Some((cert_pem, key_pem));
+    }
+
+    Ok(opts)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Parse CLI arguments.
     let cli = Cli::parse();
+
+    // Validate that --tls-client-cert and --tls-client-key are paired.
+    validate_tls_flags(&cli);
 
     // Initialize tracing (respects RUST_LOG env var).
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
+    // Build TLS options from CLI flags.
+    let tls_options = build_tls_options(&cli)
+        .await
+        .context("Failed to build TLS options")?;
+
     // Connect to the EventfoldDB server.
-    let client = Client::connect(&cli.addr)
+    let client = Client::connect(&cli.addr, tls_options)
         .await
         .context("Failed to connect to EventfoldDB server")?;
 
@@ -122,12 +213,11 @@ async fn run_event_loop(
         }
 
         // 4. Poll for key events (non-blocking with tick timeout).
-        if poll(TICK_INTERVAL)? {
-            if let Event::Key(key) = event::read()? {
-                if let Some(action) = app::handle_key_event(key, state.active_tab) {
-                    state.apply_action(action);
-                }
-            }
+        if poll(TICK_INTERVAL)?
+            && let Event::Key(key) = event::read()?
+            && let Some(action) = app::handle_key_event(key, state.active_tab)
+        {
+            state.apply_action(action);
         }
 
         // 5. Check if we should quit.
@@ -170,4 +260,62 @@ async fn handle_data_fetches(state: &mut AppState, client: &mut Client) -> Resul
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    /// Find the eventfold-console binary path in target/debug.
+    fn binary_path() -> std::path::PathBuf {
+        // `cargo test` sets CARGO_BIN_EXE_eventfold-console` or we can use
+        // `env!("CARGO_BIN_EXE_eventfold-console")` but that only works in
+        // integration tests. For unit tests in main.rs, build path manually.
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.pop(); // go from eventfold-console/ to workspace root
+        path.push("target");
+        path.push("debug");
+        path.push("eventfold-console");
+        path
+    }
+
+    #[test]
+    fn cert_without_key_exits_nonzero_and_mentions_key_flag() {
+        let output = Command::new(binary_path())
+            .arg("--tls-client-cert")
+            .arg("/dev/null")
+            .output()
+            .expect("failed to execute binary");
+
+        assert!(
+            !output.status.success(),
+            "expected non-zero exit, got: {:?}",
+            output.status
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--tls-client-key"),
+            "stderr should mention --tls-client-key, got: {stderr}"
+        );
+    }
+
+    #[test]
+    fn key_without_cert_exits_nonzero_and_mentions_cert_flag() {
+        let output = Command::new(binary_path())
+            .arg("--tls-client-key")
+            .arg("/dev/null")
+            .output()
+            .expect("failed to execute binary");
+
+        assert!(
+            !output.status.success(),
+            "expected non-zero exit, got: {:?}",
+            output.status
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--tls-client-cert"),
+            "stderr should mention --tls-client-cert, got: {stderr}"
+        );
+    }
 }

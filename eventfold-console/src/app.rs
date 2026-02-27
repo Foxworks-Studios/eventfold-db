@@ -260,14 +260,14 @@ impl AppState {
             Action::Select => {
                 // On Streams tab, Enter switches to StreamDetail for the selected stream
                 // and triggers a data load.
-                if self.active_tab == Tab::Streams {
-                    if let Some(stream) = self.streams.get(self.streams_cursor) {
-                        self.detail_stream_id = Some(stream.stream_id.clone());
-                        self.detail_events.clear();
-                        self.detail_cursor = 0;
-                        self.detail_loading = true;
-                        self.active_tab = Tab::StreamDetail;
-                    }
+                if self.active_tab == Tab::Streams
+                    && let Some(stream) = self.streams.get(self.streams_cursor)
+                {
+                    self.detail_stream_id = Some(stream.stream_id.clone());
+                    self.detail_events.clear();
+                    self.detail_cursor = 0;
+                    self.detail_loading = true;
+                    self.active_tab = Tab::StreamDetail;
                 }
             }
             Action::Refresh => {

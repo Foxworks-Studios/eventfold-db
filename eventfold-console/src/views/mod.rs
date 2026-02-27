@@ -25,12 +25,10 @@ pub mod streams;
 ///
 /// A formatted string representation of the bytes.
 pub fn format_bytes(bytes: &[u8], pretty_json: bool) -> String {
-    if pretty_json {
-        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
-            // serde_json::to_string_pretty never fails on a valid Value.
-            return serde_json::to_string_pretty(&value)
-                .expect("serializing valid JSON value should not fail");
-        }
+    if pretty_json && let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        // serde_json::to_string_pretty never fails on a valid Value.
+        return serde_json::to_string_pretty(&value)
+            .expect("serializing valid JSON value should not fail");
     }
 
     if let Ok(s) = std::str::from_utf8(bytes) {

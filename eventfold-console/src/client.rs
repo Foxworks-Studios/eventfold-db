@@ -15,6 +15,26 @@ use eventfold_db::proto::{
 use crate::app::{EventRecord, StreamInfo};
 use crate::error::ConsoleError;
 
+/// TLS options for connecting to EventfoldDB.
+///
+/// When `enabled` is `false` (the default), all other fields are ignored and
+/// the client connects over plaintext.
+///
+/// # Fields
+///
+/// * `enabled` - Whether to use TLS for the connection.
+/// * `ca_pem` - Optional PEM-encoded CA certificate for server verification.
+/// * `identity` - Optional `(cert_pem, key_pem)` pair for mTLS client identity.
+#[derive(Debug, Clone, Default)]
+pub struct TlsOptions {
+    /// Enable TLS. When false, all other fields are ignored.
+    pub enabled: bool,
+    /// PEM-encoded CA certificate for server verification.
+    pub ca_pem: Option<Vec<u8>>,
+    /// PEM-encoded client certificate and key for mTLS: `(cert_pem, key_pem)`.
+    pub identity: Option<(Vec<u8>, Vec<u8>)>,
+}
+
 /// A wrapper around the tonic gRPC client for EventfoldDB.
 ///
 /// Provides high-level methods that return TUI-friendly types rather than
@@ -31,6 +51,8 @@ impl Client {
     /// # Arguments
     ///
     /// * `addr` - The server address (e.g. "http://127.0.0.1:2113").
+    /// * `tls` - TLS options. When `tls.enabled` is `true`, the connection uses
+    ///   TLS (and optionally mTLS). When `false`, connects over plaintext.
     ///
     /// # Returns
     ///
@@ -40,10 +62,32 @@ impl Client {
     ///
     /// Returns [`ConsoleError::ConnectionFailed`] if the connection cannot be
     /// established.
-    pub async fn connect(addr: &str) -> Result<Self, ConsoleError> {
-        let inner = EventStoreClient::connect(addr.to_string())
-            .await
-            .map_err(|e| ConsoleError::ConnectionFailed(e.to_string()))?;
+    pub async fn connect(addr: &str, tls: TlsOptions) -> Result<Self, ConsoleError> {
+        let channel = if tls.enabled {
+            let mut tls_config = tonic::transport::ClientTlsConfig::new();
+            if let Some(ca_pem) = tls.ca_pem {
+                tls_config =
+                    tls_config.ca_certificate(tonic::transport::Certificate::from_pem(ca_pem));
+            }
+            if let Some((cert_pem, key_pem)) = tls.identity {
+                tls_config =
+                    tls_config.identity(tonic::transport::Identity::from_pem(cert_pem, key_pem));
+            }
+            tonic::transport::Channel::from_shared(addr.to_string())
+                .map_err(|e| ConsoleError::ConnectionFailed(e.to_string()))?
+                .tls_config(tls_config)
+                .map_err(|e| ConsoleError::ConnectionFailed(e.to_string()))?
+                .connect()
+                .await
+                .map_err(|e| ConsoleError::ConnectionFailed(e.to_string()))?
+        } else {
+            tonic::transport::Channel::from_shared(addr.to_string())
+                .map_err(|e| ConsoleError::ConnectionFailed(e.to_string()))?
+                .connect()
+                .await
+                .map_err(|e| ConsoleError::ConnectionFailed(e.to_string()))?
+        };
+        let inner = EventStoreClient::new(channel);
         Ok(Self { inner })
     }
 
@@ -205,10 +249,9 @@ pub async fn spawn_subscription(
     };
 
     let mut stream = stream;
-    while let Ok(Some(resp)) = stream.message().await.map(Some).or_else(|e| {
+    while let Ok(Some(resp)) = stream.message().await.map(Some).inspect_err(|e| {
         // If the stream errors, report it and stop.
         let _ = tx.blocking_send(SubscriptionMsg::Error(e.to_string()));
-        Err(e)
     }) {
         let Some(resp) = resp else { break };
         match resp.content {
@@ -315,5 +358,41 @@ mod tests {
         let msg = SubscriptionMsg::Error("test error".into());
         let debug = format!("{msg:?}");
         assert!(debug.contains("test error"));
+    }
+
+    // -- TlsOptions --
+
+    #[test]
+    fn tls_options_default_has_tls_disabled() {
+        let opts = TlsOptions::default();
+        assert!(!opts.enabled);
+        assert!(opts.ca_pem.is_none());
+        assert!(opts.identity.is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_plaintext_no_server_returns_connection_failed() {
+        let result = Client::connect("http://[::1]:0", TlsOptions::default()).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ConsoleError::ConnectionFailed(_)),
+            "expected ConnectionFailed, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_tls_no_server_returns_connection_failed() {
+        let tls = TlsOptions {
+            enabled: true,
+            ..Default::default()
+        };
+        let result = Client::connect("http://[::1]:0", tls).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ConsoleError::ConnectionFailed(_)),
+            "expected ConnectionFailed, got: {err:?}"
+        );
     }
 }
