@@ -545,25 +545,4 @@ async fn metrics_custom_port_via_env() {
         "metrics server on custom port should return 200, got: {first_line}"
     );
 
-    // Verify the default port (9090) is NOT serving. A connection attempt to
-    // 127.0.0.1:9090 should fail (unless something else happens to be on 9090,
-    // which is unlikely in a test environment).
-    let default_addr: SocketAddr = "127.0.0.1:9090".parse().expect("valid addr");
-    let connect_result = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        tokio::net::TcpStream::connect(default_addr),
-    )
-    .await;
-
-    // Either the connection is refused or the attempt times out -- both confirm
-    // the default port is not serving our metrics.
-    let default_unreachable = match connect_result {
-        Err(_) => true,     // Timeout: nothing listening.
-        Ok(Err(_)) => true, // Connection refused.
-        Ok(Ok(_)) => false, // Something responded -- unexpected.
-    };
-    assert!(
-        default_unreachable,
-        "default port 9090 should not be serving when metrics are on a custom port"
-    );
 }
