@@ -121,6 +121,28 @@ pub enum SubscriptionMessage {
     CaughtUp,
 }
 
+/// Metadata about a single stream returned by `ReadIndex::list_streams`.
+///
+/// Contains the stream's UUID, the total number of events appended to it,
+/// and the zero-based version of the most recently written event. This type
+/// carries no event data (payload, metadata, event type) -- only stream-level
+/// summary information.
+///
+/// # Fields
+///
+/// * `stream_id` - UUID identifying the stream.
+/// * `event_count` - Total number of events in the stream.
+/// * `latest_version` - Zero-based version of the last event written to the stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamInfo {
+    /// UUID identifying the stream.
+    pub stream_id: Uuid,
+    /// Total number of events in the stream.
+    pub event_count: u64,
+    /// Zero-based version of the last event written to the stream.
+    pub latest_version: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +342,35 @@ mod tests {
             }
             _ => panic!("expected Event variant"),
         }
+    }
+
+    // PRD 014, Ticket 1: StreamInfo tests.
+
+    #[test]
+    fn stream_info_clone_equals_original() {
+        let info = StreamInfo {
+            stream_id: Uuid::new_v4(),
+            event_count: 3,
+            latest_version: 2,
+        };
+        let cloned = info.clone();
+        assert_eq!(info, cloned);
+    }
+
+    #[test]
+    fn stream_info_differing_event_count_not_equal() {
+        let stream_id = Uuid::new_v4();
+        let info_a = StreamInfo {
+            stream_id,
+            event_count: 3,
+            latest_version: 2,
+        };
+        let info_b = StreamInfo {
+            stream_id,
+            event_count: 5,
+            latest_version: 2,
+        };
+        assert_ne!(info_a, info_b);
     }
 
     #[test]

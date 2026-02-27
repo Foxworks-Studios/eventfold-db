@@ -8,8 +8,8 @@ use tonic::Streaming;
 
 use eventfold_db::proto::event_store_client::EventStoreClient;
 use eventfold_db::proto::{
-    ReadAllRequest, ReadAllResponse, ReadStreamRequest, ReadStreamResponse, SubscribeAllRequest,
-    SubscribeResponse,
+    ListStreamsRequest, ReadAllRequest, ReadAllResponse, ReadStreamRequest, ReadStreamResponse,
+    SubscribeAllRequest, SubscribeResponse,
 };
 
 use crate::app::{EventRecord, StreamInfo};
@@ -154,14 +154,10 @@ impl Client {
         Ok(resp.events.into_iter().map(proto_to_event_record).collect())
     }
 
-    /// Derive a list of all streams by scanning the entire global log.
+    /// List all streams via the `ListStreams` RPC.
     ///
-    /// Since there is no `ListStreams` RPC, this fetches all events in pages
-    /// of `page_size` and collects unique stream IDs with counts.
-    ///
-    /// # Arguments
-    ///
-    /// * `page_size` - Number of events per page during the scan.
+    /// Returns stream metadata (ID, event count, latest version) for every
+    /// known stream in a single round trip. Results are sorted by stream ID.
     ///
     /// # Returns
     ///
@@ -170,18 +166,21 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`ConsoleError::Grpc`] on server or transport errors.
-    pub async fn list_streams(&mut self, page_size: u64) -> Result<Vec<StreamInfo>, ConsoleError> {
-        let mut all_events = Vec::new();
-        let mut from_position = 0u64;
-        loop {
-            let page = self.read_all(from_position, page_size).await?;
-            if page.is_empty() {
-                break;
-            }
-            from_position += page.len() as u64;
-            all_events.extend(page);
-        }
-        Ok(crate::app::AppState::collect_streams(&all_events))
+    pub async fn list_streams(&mut self) -> Result<Vec<StreamInfo>, ConsoleError> {
+        let response = self
+            .inner
+            .list_streams(ListStreamsRequest {})
+            .await?
+            .into_inner();
+        Ok(response
+            .streams
+            .into_iter()
+            .map(|s| StreamInfo {
+                stream_id: s.stream_id,
+                event_count: s.event_count,
+                latest_version: s.latest_version,
+            })
+            .collect())
     }
 
     /// Open a `SubscribeAll` streaming subscription.

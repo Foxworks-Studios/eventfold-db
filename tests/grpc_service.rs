@@ -1280,6 +1280,205 @@ async fn subscribe_all_yields_nonzero_recorded_at() {
     }
 }
 
+// -- ListStreams tests --
+
+#[tokio::test]
+async fn list_streams_on_empty_store_returns_empty() {
+    let (mut client, _addr, _dir) = start_test_server().await;
+
+    let resp = client
+        .list_streams(proto::ListStreamsRequest {})
+        .await
+        .expect("list_streams on empty store should succeed");
+
+    let streams = resp.into_inner().streams;
+    assert!(streams.is_empty(), "empty store should return no streams");
+}
+
+#[tokio::test]
+async fn list_streams_returns_correct_metadata_for_multiple_streams() {
+    let (mut client, _addr, _dir) = start_test_server().await;
+
+    // Fixed UUIDs with known lexicographic order: A < B < C.
+    let stream_a = "00000000-0000-4000-8000-000000000001".to_string();
+    let stream_b = "00000000-0000-4000-8000-000000000002".to_string();
+    let stream_c = "00000000-0000-4000-8000-000000000003".to_string();
+
+    // Append 1 event to stream A.
+    client
+        .append(proto::AppendRequest {
+            stream_id: stream_a.clone(),
+            expected_version: no_stream(),
+            events: vec![make_proposed("A0")],
+        })
+        .await
+        .expect("append A should succeed");
+
+    // Append 2 events to stream B.
+    client
+        .append(proto::AppendRequest {
+            stream_id: stream_b.clone(),
+            expected_version: no_stream(),
+            events: vec![make_proposed("B0"), make_proposed("B1")],
+        })
+        .await
+        .expect("append B should succeed");
+
+    // Append 3 events to stream C.
+    client
+        .append(proto::AppendRequest {
+            stream_id: stream_c.clone(),
+            expected_version: no_stream(),
+            events: vec![
+                make_proposed("C0"),
+                make_proposed("C1"),
+                make_proposed("C2"),
+            ],
+        })
+        .await
+        .expect("append C should succeed");
+
+    let resp = client
+        .list_streams(proto::ListStreamsRequest {})
+        .await
+        .expect("list_streams should succeed");
+
+    let streams = resp.into_inner().streams;
+    assert_eq!(streams.len(), 3, "should have exactly 3 streams");
+
+    // Entries should be sorted lexicographically: A, B, C.
+    assert_eq!(streams[0].stream_id, stream_a);
+    assert_eq!(streams[0].event_count, 1);
+    assert_eq!(streams[0].latest_version, 0);
+
+    assert_eq!(streams[1].stream_id, stream_b);
+    assert_eq!(streams[1].event_count, 2);
+    assert_eq!(streams[1].latest_version, 1);
+
+    assert_eq!(streams[2].stream_id, stream_c);
+    assert_eq!(streams[2].event_count, 3);
+    assert_eq!(streams[2].latest_version, 2);
+}
+
+#[tokio::test]
+async fn list_streams_results_are_sorted_lexicographically() {
+    let (mut client, _addr, _dir) = start_test_server().await;
+
+    // Fixed UUIDs with known lexicographic order: A < B < C.
+    // Append in reverse order (C, B, A) to confirm sorting is by ID, not insertion order.
+    let stream_a = "00000000-0000-4000-8000-000000000001".to_string();
+    let stream_b = "00000000-0000-4000-8000-000000000002".to_string();
+    let stream_c = "00000000-0000-4000-8000-000000000003".to_string();
+
+    // Append in reverse order: C first, then B, then A.
+    client
+        .append(proto::AppendRequest {
+            stream_id: stream_c.clone(),
+            expected_version: no_stream(),
+            events: vec![
+                make_proposed("C0"),
+                make_proposed("C1"),
+                make_proposed("C2"),
+            ],
+        })
+        .await
+        .expect("append C should succeed");
+
+    client
+        .append(proto::AppendRequest {
+            stream_id: stream_b.clone(),
+            expected_version: no_stream(),
+            events: vec![make_proposed("B0"), make_proposed("B1")],
+        })
+        .await
+        .expect("append B should succeed");
+
+    client
+        .append(proto::AppendRequest {
+            stream_id: stream_a.clone(),
+            expected_version: no_stream(),
+            events: vec![make_proposed("A0")],
+        })
+        .await
+        .expect("append A should succeed");
+
+    let resp = client
+        .list_streams(proto::ListStreamsRequest {})
+        .await
+        .expect("list_streams should succeed");
+
+    let streams = resp.into_inner().streams;
+    assert_eq!(streams.len(), 3, "should have exactly 3 streams");
+
+    // Verify ascending lexicographic order by stream_id.
+    for i in 0..streams.len() - 1 {
+        assert!(
+            streams[i].stream_id <= streams[i + 1].stream_id,
+            "streams should be sorted lexicographically: {} should come before {}",
+            streams[i].stream_id,
+            streams[i + 1].stream_id,
+        );
+    }
+
+    // Double-check the exact order.
+    assert_eq!(streams[0].stream_id, stream_a);
+    assert_eq!(streams[1].stream_id, stream_b);
+    assert_eq!(streams[2].stream_id, stream_c);
+}
+
+#[tokio::test]
+async fn list_streams_reflects_additional_appends() {
+    let (mut client, _addr, _dir) = start_test_server().await;
+
+    let stream_a = uuid::Uuid::new_v4().to_string();
+
+    // Append 1 event to stream A.
+    client
+        .append(proto::AppendRequest {
+            stream_id: stream_a.clone(),
+            expected_version: no_stream(),
+            events: vec![make_proposed("A0")],
+        })
+        .await
+        .expect("first append should succeed");
+
+    // First ListStreams call: count=1, latest_version=0.
+    let resp = client
+        .list_streams(proto::ListStreamsRequest {})
+        .await
+        .expect("list_streams should succeed");
+
+    let streams = resp.into_inner().streams;
+    assert_eq!(streams.len(), 1, "should have exactly 1 stream");
+    assert_eq!(streams[0].stream_id, stream_a);
+    assert_eq!(streams[0].event_count, 1);
+    assert_eq!(streams[0].latest_version, 0);
+
+    // Append 2 more events to stream A (expected_version = 0, the current latest).
+    client
+        .append(proto::AppendRequest {
+            stream_id: stream_a.clone(),
+            expected_version: Some(proto::ExpectedVersion {
+                kind: Some(expected_version::Kind::Exact(0)),
+            }),
+            events: vec![make_proposed("A1"), make_proposed("A2")],
+        })
+        .await
+        .expect("second append should succeed");
+
+    // Second ListStreams call: count=3, latest_version=2.
+    let resp = client
+        .list_streams(proto::ListStreamsRequest {})
+        .await
+        .expect("list_streams should succeed after additional appends");
+
+    let streams = resp.into_inner().streams;
+    assert_eq!(streams.len(), 1, "should still have exactly 1 stream");
+    assert_eq!(streams[0].stream_id, stream_a);
+    assert_eq!(streams[0].event_count, 3);
+    assert_eq!(streams[0].latest_version, 2);
+}
+
 // -- Error codes test: verify INVALID_ARGUMENT, NOT_FOUND, FAILED_PRECONDITION in one test --
 
 #[tokio::test]

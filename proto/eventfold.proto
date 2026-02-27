@@ -7,6 +7,7 @@ service EventStore {
     rpc ReadAll(ReadAllRequest) returns (ReadAllResponse);
     rpc SubscribeAll(SubscribeAllRequest) returns (stream SubscribeResponse);
     rpc SubscribeStream(SubscribeStreamRequest) returns (stream SubscribeResponse);
+    rpc ListStreams(ListStreamsRequest) returns (ListStreamsResponse);
 }
 
 message ProposedEvent {
@@ -83,4 +84,16 @@ message SubscribeResponse {
         RecordedEvent event = 1;
         Empty caught_up = 2;
     }
+}
+
+message ListStreamsRequest {}
+
+message StreamInfo {
+    string stream_id = 1;       // UUID string
+    uint64 event_count = 2;
+    uint64 latest_version = 3;
+}
+
+message ListStreamsResponse {
+    repeated StreamInfo streams = 1;
 }

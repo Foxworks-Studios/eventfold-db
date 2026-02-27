@@ -52,9 +52,6 @@ struct Cli {
 /// Tick interval for the event loop (approximately 30 fps).
 const TICK_INTERVAL: Duration = Duration::from_millis(33);
 
-/// Page size for listing streams via ReadAll scan.
-const LIST_STREAMS_PAGE_SIZE: u64 = 1000;
-
 /// Page size for reading events in the detail and global log views.
 const READ_PAGE_SIZE: u64 = 1000;
 
@@ -233,7 +230,7 @@ async fn run_event_loop(
 /// updates the state, then clears the flag.
 async fn handle_data_fetches(state: &mut AppState, client: &mut Client) -> Result<()> {
     if state.streams_loading {
-        match client.list_streams(LIST_STREAMS_PAGE_SIZE).await {
+        match client.list_streams().await {
             Ok(streams) => state.streams = streams,
             Err(e) => tracing::error!(error = %e, "Failed to list streams"),
         }

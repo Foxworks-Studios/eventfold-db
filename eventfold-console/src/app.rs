@@ -4,7 +4,7 @@
 //! [`Tab`] enum for navigation, and the [`Action`] enum for user-triggered
 //! actions. Key events are mapped to actions via [`handle_key_event`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -288,31 +288,6 @@ impl AppState {
             }
         }
     }
-
-    /// Collect unique streams from a batch of events (e.g. from a ReadAll scan).
-    ///
-    /// Builds `StreamInfo` entries by tracking max stream_version and count
-    /// per stream_id. Results are sorted by stream_id for stable display order.
-    pub fn collect_streams(events: &[EventRecord]) -> Vec<StreamInfo> {
-        let mut map: HashMap<&str, (u64, u64)> = HashMap::new();
-        for event in events {
-            let entry = map.entry(&event.stream_id).or_insert((0, 0));
-            entry.0 += 1; // event_count
-            if event.stream_version > entry.1 {
-                entry.1 = event.stream_version; // latest_version
-            }
-        }
-        let mut streams: Vec<StreamInfo> = map
-            .into_iter()
-            .map(|(id, (count, version))| StreamInfo {
-                stream_id: id.to_string(),
-                event_count: count,
-                latest_version: version,
-            })
-            .collect();
-        streams.sort_by(|a, b| a.stream_id.cmp(&b.stream_id));
-        streams
-    }
 }
 
 /// Map a crossterm [`KeyEvent`] to an [`Action`], if applicable.
@@ -586,32 +561,6 @@ mod tests {
         assert_eq!(state.live_events.front().unwrap().global_position, 5);
     }
 
-    // -- collect_streams --
-
-    #[test]
-    fn collect_streams_groups_by_stream_id() {
-        let events = vec![
-            make_event_with_stream("s1", 0, 0),
-            make_event_with_stream("s1", 1, 1),
-            make_event_with_stream("s2", 0, 2),
-        ];
-        let streams = AppState::collect_streams(&events);
-        assert_eq!(streams.len(), 2);
-        // Sorted by stream_id.
-        assert_eq!(streams[0].stream_id, "s1");
-        assert_eq!(streams[0].event_count, 2);
-        assert_eq!(streams[0].latest_version, 1);
-        assert_eq!(streams[1].stream_id, "s2");
-        assert_eq!(streams[1].event_count, 1);
-        assert_eq!(streams[1].latest_version, 0);
-    }
-
-    #[test]
-    fn collect_streams_empty_input_returns_empty() {
-        let streams = AppState::collect_streams(&[]);
-        assert!(streams.is_empty());
-    }
-
     // -- Key event mapping --
 
     #[test]
@@ -726,22 +675,6 @@ mod tests {
             event_id: format!("eid-{global_position}"),
             stream_id: "stream-1".into(),
             stream_version: global_position,
-            global_position,
-            event_type: "TestEvent".into(),
-            metadata: vec![],
-            payload: vec![],
-        }
-    }
-
-    fn make_event_with_stream(
-        stream_id: &str,
-        stream_version: u64,
-        global_position: u64,
-    ) -> EventRecord {
-        EventRecord {
-            event_id: format!("eid-{global_position}"),
-            stream_id: stream_id.into(),
-            stream_version,
             global_position,
             event_type: "TestEvent".into(),
             metadata: vec![],

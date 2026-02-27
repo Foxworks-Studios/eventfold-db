@@ -19,7 +19,9 @@ use crate::broker::Broker;
 use crate::error::Error;
 use crate::proto;
 use crate::reader::ReadIndex;
-use crate::types::{ExpectedVersion, ProposedEvent, RecordedEvent, SubscriptionMessage};
+use crate::types::{
+    ExpectedVersion, ProposedEvent, RecordedEvent, StreamInfo, SubscriptionMessage,
+};
 use crate::writer::WriterHandle;
 
 /// gRPC service implementation for EventfoldDB.
@@ -271,6 +273,23 @@ impl proto::event_store_server::EventStore for EventfoldService {
 
         Ok(tonic::Response::new(Box::pin(mapped)))
     }
+
+    /// List all known streams with their event counts and latest versions.
+    ///
+    /// Reads directly from the in-memory index; event data is never accessed.
+    /// Returns an empty list on an empty store (never an error status).
+    async fn list_streams(
+        &self,
+        _request: tonic::Request<proto::ListStreamsRequest>,
+    ) -> Result<tonic::Response<proto::ListStreamsResponse>, tonic::Status> {
+        let streams = self
+            .read_index
+            .list_streams()
+            .into_iter()
+            .map(stream_info_to_proto)
+            .collect();
+        Ok(tonic::Response::new(proto::ListStreamsResponse { streams }))
+    }
 }
 
 /// RAII guard that increments the `eventfold_subscriptions_active` gauge on
@@ -396,6 +415,25 @@ pub fn recorded_to_proto(e: &RecordedEvent) -> proto::RecordedEvent {
         metadata: e.metadata.to_vec(),
         payload: e.payload.to_vec(),
         recorded_at: e.recorded_at,
+    }
+}
+
+/// Convert a domain [`StreamInfo`] to the protobuf `StreamInfo` type.
+///
+/// The stream UUID is serialized as a hyphenated lowercase string.
+///
+/// # Arguments
+///
+/// * `s` - The domain `StreamInfo` to convert.
+///
+/// # Returns
+///
+/// The corresponding protobuf `StreamInfo`.
+pub fn stream_info_to_proto(s: StreamInfo) -> proto::StreamInfo {
+    proto::StreamInfo {
+        stream_id: s.stream_id.to_string(),
+        event_count: s.event_count,
+        latest_version: s.latest_version,
     }
 }
 
@@ -815,6 +853,85 @@ mod tests {
             0.0,
             "gauge should return to original value after stream is dropped"
         );
+    }
+
+    // -- stream_info_to_proto tests (PRD 014, Ticket 4) --
+
+    #[test]
+    fn stream_info_to_proto_maps_all_fields() {
+        let known_uuid: Uuid = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+            .parse()
+            .expect("valid uuid");
+        let info = crate::types::StreamInfo {
+            stream_id: known_uuid,
+            event_count: 5,
+            latest_version: 4,
+        };
+        let proto_result = stream_info_to_proto(info);
+        assert_eq!(proto_result.stream_id, known_uuid.to_string());
+        assert_eq!(proto_result.event_count, 5);
+        assert_eq!(proto_result.latest_version, 4);
+    }
+
+    #[tokio::test]
+    async fn list_streams_empty_store_returns_ok_with_empty_list() {
+        use crate::proto::event_store_server::EventStore;
+
+        let (service, _dir) = temp_service();
+        let response = service
+            .list_streams(tonic::Request::new(proto::ListStreamsRequest {}))
+            .await
+            .expect("list_streams on empty store should return Ok");
+        assert!(
+            response.into_inner().streams.is_empty(),
+            "empty store should return empty streams list"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_streams_after_append_returns_correct_stream_info() {
+        use crate::proto::event_store_server::EventStore;
+
+        let (service, _dir) = temp_service();
+
+        // Append 2 events to the same stream.
+        let stream_id = Uuid::new_v4();
+        let append_req = tonic::Request::new(proto::AppendRequest {
+            stream_id: stream_id.to_string(),
+            expected_version: Some(proto::ExpectedVersion {
+                kind: Some(proto::expected_version::Kind::NoStream(proto::Empty {})),
+            }),
+            events: vec![
+                proto::ProposedEvent {
+                    event_id: Uuid::new_v4().to_string(),
+                    event_type: "TestEvent".to_string(),
+                    metadata: vec![],
+                    payload: b"{}".to_vec(),
+                },
+                proto::ProposedEvent {
+                    event_id: Uuid::new_v4().to_string(),
+                    event_type: "TestEvent".to_string(),
+                    metadata: vec![],
+                    payload: b"{}".to_vec(),
+                },
+            ],
+        });
+        service
+            .append(append_req)
+            .await
+            .expect("append should succeed");
+
+        let response = service
+            .list_streams(tonic::Request::new(proto::ListStreamsRequest {}))
+            .await
+            .expect("list_streams should return Ok");
+        let streams = response.into_inner().streams;
+
+        assert_eq!(streams.len(), 1, "should contain exactly 1 stream");
+        let info = &streams[0];
+        assert_eq!(info.stream_id, stream_id.to_string());
+        assert_eq!(info.event_count, 2);
+        assert_eq!(info.latest_version, 1);
     }
 
     #[tokio::test]

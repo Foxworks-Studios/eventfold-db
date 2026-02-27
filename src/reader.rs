@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::error::Error;
 use crate::store::EventLog;
-use crate::types::RecordedEvent;
+use crate::types::{RecordedEvent, StreamInfo};
 
 /// Shared, read-only handle to the in-memory event log.
 ///
@@ -70,6 +70,40 @@ impl ReadIndex {
     pub fn global_position(&self) -> u64 {
         let log = self.log.read().expect("EventLog RwLock poisoned");
         log.events.len() as u64
+    }
+
+    /// Return metadata for all known streams, sorted lexicographically by stream
+    /// ID string (UUID hyphenated lowercase).
+    ///
+    /// Acquires a single `RwLock` read guard for the entire operation. The method
+    /// iterates only `EventLog::streams` (the `HashMap<Uuid, Vec<u64>>`); it never
+    /// accesses `EventLog::events` or any event payload, metadata, or event-type
+    /// fields. This makes the operation O(s) where s is the number of distinct
+    /// streams.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<StreamInfo>` sorted by `stream_id.to_string()`. Returns an empty
+    /// `Vec` when no streams exist.
+    pub fn list_streams(&self) -> Vec<StreamInfo> {
+        let log = self.log.read().expect("EventLog RwLock poisoned");
+        let mut streams: Vec<StreamInfo> = log
+            .streams
+            .iter()
+            .map(|(id, positions)| {
+                // Safety: any stream in `EventLog::streams` has at least one
+                // position. Stream entries are created on first append and never
+                // removed, so `positions.len()` is always >= 1. This guarantees
+                // the subtraction does not underflow.
+                StreamInfo {
+                    stream_id: *id,
+                    event_count: positions.len() as u64,
+                    latest_version: positions.len() as u64 - 1,
+                }
+            })
+            .collect();
+        streams.sort_by(|a, b| a.stream_id.to_string().cmp(&b.stream_id.to_string()));
+        streams
     }
 
     /// Read events from a specific stream starting at a given version.
@@ -279,6 +313,152 @@ mod tests {
             Err(other) => panic!("expected StreamNotFound, got: {other:?}"),
             Ok(_) => panic!("expected StreamNotFound error, but read_stream succeeded"),
         }
+    }
+
+    // PRD 014, Ticket 3: list_streams tests.
+
+    #[test]
+    fn list_streams_returns_correct_counts_and_versions() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+        let mut store = Store::open(&path).expect("open should succeed");
+
+        let stream_a = Uuid::new_v4();
+        let stream_b = Uuid::new_v4();
+
+        // Append 3 events to stream A.
+        store
+            .append(stream_a, ExpectedVersion::NoStream, 0, vec![proposed("E1")])
+            .expect("append should succeed");
+        store
+            .append(stream_a, ExpectedVersion::Exact(0), 0, vec![proposed("E2")])
+            .expect("append should succeed");
+        store
+            .append(stream_a, ExpectedVersion::Exact(1), 0, vec![proposed("E3")])
+            .expect("append should succeed");
+
+        // Append 1 event to stream B.
+        store
+            .append(stream_b, ExpectedVersion::NoStream, 0, vec![proposed("E4")])
+            .expect("append should succeed");
+
+        let index = ReadIndex::new(store.log());
+        let streams = index.list_streams();
+
+        assert_eq!(streams.len(), 2);
+
+        // Find each stream in the result by ID.
+        let info_a = streams
+            .iter()
+            .find(|s| s.stream_id == stream_a)
+            .expect("stream A missing");
+        let info_b = streams
+            .iter()
+            .find(|s| s.stream_id == stream_b)
+            .expect("stream B missing");
+
+        assert_eq!(info_a.event_count, 3);
+        assert_eq!(info_a.latest_version, 2);
+        assert_eq!(info_b.event_count, 1);
+        assert_eq!(info_b.latest_version, 0);
+    }
+
+    #[test]
+    fn list_streams_sorted_lexicographically_by_stream_id() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+        let mut store = Store::open(&path).expect("open should succeed");
+
+        // Create three UUIDs with known string sort order.
+        // UUID strings are hyphenated lowercase hex, so we control sort by
+        // choosing the first hex digit: "1..." < "5..." < "9...".
+        let uuid_a: Uuid = "10000000-0000-4000-8000-000000000000"
+            .parse()
+            .expect("valid uuid");
+        let uuid_b: Uuid = "50000000-0000-4000-8000-000000000000"
+            .parse()
+            .expect("valid uuid");
+        let uuid_c: Uuid = "90000000-0000-4000-8000-000000000000"
+            .parse()
+            .expect("valid uuid");
+
+        // Verify our assumption about sort order.
+        assert!(uuid_c.to_string() > uuid_a.to_string());
+        assert!(uuid_c.to_string() > uuid_b.to_string());
+        assert!(uuid_a.to_string() < uuid_b.to_string());
+
+        // Append in order C, A, B (not sorted) to prove the method sorts.
+        store
+            .append(uuid_c, ExpectedVersion::NoStream, 0, vec![proposed("E1")])
+            .expect("append should succeed");
+        store
+            .append(uuid_a, ExpectedVersion::NoStream, 0, vec![proposed("E2")])
+            .expect("append should succeed");
+        store
+            .append(uuid_b, ExpectedVersion::NoStream, 0, vec![proposed("E3")])
+            .expect("append should succeed");
+
+        let index = ReadIndex::new(store.log());
+        let streams = index.list_streams();
+
+        assert_eq!(streams.len(), 3);
+        assert_eq!(streams[0].stream_id, uuid_a);
+        assert_eq!(streams[1].stream_id, uuid_b);
+        assert_eq!(streams[2].stream_id, uuid_c);
+    }
+
+    #[test]
+    fn list_streams_shared_state_consistency() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+        let mut store = Store::open(&path).expect("open should succeed");
+
+        let log = store.log();
+        let index_a = ReadIndex::new(Arc::clone(&log));
+        let index_b = ReadIndex::new(log);
+
+        // Before appends, both see empty.
+        assert!(index_a.list_streams().is_empty());
+        assert!(index_b.list_streams().is_empty());
+
+        // Append through store.
+        let stream_id = Uuid::new_v4();
+        store
+            .append(
+                stream_id,
+                ExpectedVersion::NoStream,
+                0,
+                vec![proposed("Created")],
+            )
+            .expect("append should succeed");
+        store
+            .append(
+                stream_id,
+                ExpectedVersion::Exact(0),
+                0,
+                vec![proposed("Updated")],
+            )
+            .expect("append should succeed");
+
+        // Both clones return identical results.
+        let streams_a = index_a.list_streams();
+        let streams_b = index_b.list_streams();
+        assert_eq!(streams_a, streams_b);
+        assert_eq!(streams_a.len(), 1);
+        assert_eq!(streams_a[0].stream_id, stream_id);
+        assert_eq!(streams_a[0].event_count, 2);
+        assert_eq!(streams_a[0].latest_version, 1);
+    }
+
+    #[test]
+    fn list_streams_empty_store_returns_empty_vec() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let path = dir.path().join("events.log");
+        let store = Store::open(&path).expect("open should succeed");
+        let index = ReadIndex::new(store.log());
+
+        let streams = index.list_streams();
+        assert!(streams.is_empty());
     }
 
     #[test]
