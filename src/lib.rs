@@ -3,7 +3,12 @@
 pub mod broker;
 pub mod codec;
 pub mod error;
+/// Generated protobuf types for the EventfoldDB gRPC API.
+pub mod proto {
+    tonic::include_proto!("eventfold");
+}
 pub mod reader;
+pub mod service;
 pub mod store;
 pub mod types;
 pub mod writer;
@@ -12,6 +17,7 @@ pub use broker::{Broker, subscribe_all, subscribe_stream};
 pub use codec::DecodeOutcome;
 pub use error::Error;
 pub use reader::ReadIndex;
+pub use service::EventfoldService;
 pub use store::Store;
 pub use types::{
     ExpectedVersion, MAX_EVENT_SIZE, MAX_EVENT_TYPE_LEN, ProposedEvent, RecordedEvent,
@@ -77,5 +83,32 @@ mod tests {
     fn reexport_error() {
         let err = crate::Error::InvalidArgument("test".into());
         assert!(err.to_string().contains("test"));
+    }
+
+    #[test]
+    fn proto_append_request_default() {
+        // Verify that the generated proto types are accessible and constructable.
+        let req = crate::proto::AppendRequest::default();
+        assert!(req.stream_id.is_empty());
+        assert!(req.events.is_empty());
+        assert!(req.expected_version.is_none());
+    }
+
+    #[test]
+    fn eventfold_service_accessible_at_crate_root() {
+        // Verify that `crate::EventfoldService` resolves and that its constructor
+        // has the expected signature (WriterHandle, ReadIndex, Broker) -> EventfoldService.
+        let _: fn(crate::WriterHandle, crate::ReadIndex, crate::Broker) -> crate::EventfoldService =
+            crate::EventfoldService::new;
+    }
+
+    #[test]
+    fn event_store_server_accessible_via_proto() {
+        // Verify that the tonic-generated EventStoreServer is reachable through
+        // `crate::proto::event_store_server` and can be parameterized with
+        // `crate::EventfoldService`.
+        let _new_fn =
+            crate::proto::event_store_server::EventStoreServer::<crate::EventfoldService>::new;
+        // If this compiles, the type path is valid and accessible.
     }
 }

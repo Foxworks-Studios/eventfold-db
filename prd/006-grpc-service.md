@@ -1,5 +1,7 @@
 # PRD 006: gRPC Service
 
+**Status:** TICKETS READY
+
 ## Summary
 
 Define the Protocol Buffers schema and implement the tonic gRPC service for EventfoldDB's five RPCs: `Append`, `ReadStream`, `ReadAll`, `SubscribeAll`, and `SubscribeStream`. This is the network-facing API that clients interact with. The service layer is thin -- it validates and translates gRPC requests into calls to the writer task and read index, and maps domain errors to gRPC status codes.

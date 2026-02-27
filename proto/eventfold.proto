@@ -1,0 +1,85 @@
+syntax = "proto3";
+package eventfold;
+
+service EventStore {
+    rpc Append(AppendRequest) returns (AppendResponse);
+    rpc ReadStream(ReadStreamRequest) returns (ReadStreamResponse);
+    rpc ReadAll(ReadAllRequest) returns (ReadAllResponse);
+    rpc SubscribeAll(SubscribeAllRequest) returns (stream SubscribeResponse);
+    rpc SubscribeStream(SubscribeStreamRequest) returns (stream SubscribeResponse);
+}
+
+message ProposedEvent {
+    string event_id = 1;     // UUID string
+    string event_type = 2;
+    bytes metadata = 3;
+    bytes payload = 4;
+}
+
+message RecordedEvent {
+    string event_id = 1;     // UUID string
+    string stream_id = 2;    // UUID string
+    uint64 stream_version = 3;
+    uint64 global_position = 4;
+    string event_type = 5;
+    bytes metadata = 6;
+    bytes payload = 7;
+}
+
+message ExpectedVersion {
+    oneof kind {
+        Empty any = 1;
+        Empty no_stream = 2;
+        uint64 exact = 3;
+    }
+}
+
+message Empty {}
+
+message AppendRequest {
+    string stream_id = 1;    // UUID string
+    ExpectedVersion expected_version = 2;
+    repeated ProposedEvent events = 3;
+}
+
+message AppendResponse {
+    uint64 first_stream_version = 1;
+    uint64 last_stream_version = 2;
+    uint64 first_global_position = 3;
+    uint64 last_global_position = 4;
+}
+
+message ReadStreamRequest {
+    string stream_id = 1;    // UUID string
+    uint64 from_version = 2;
+    uint64 max_count = 3;
+}
+
+message ReadStreamResponse {
+    repeated RecordedEvent events = 1;
+}
+
+message ReadAllRequest {
+    uint64 from_position = 1;
+    uint64 max_count = 2;
+}
+
+message ReadAllResponse {
+    repeated RecordedEvent events = 1;
+}
+
+message SubscribeAllRequest {
+    uint64 from_position = 1;
+}
+
+message SubscribeStreamRequest {
+    string stream_id = 1;    // UUID string
+    uint64 from_version = 2;
+}
+
+message SubscribeResponse {
+    oneof content {
+        RecordedEvent event = 1;
+        Empty caught_up = 2;
+    }
+}
